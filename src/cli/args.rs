@@ -32,6 +32,10 @@ pub struct MdvArgs {
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(50..=300))]
     pub zoom: u16,
 
+    /// Where page colors come from: the terminal's own palette, or GitHub's theme.
+    #[arg(long, value_enum, default_value_t = ColorSource::Terminal)]
+    pub colors: ColorSource,
+
     /// How the page moves between scroll positions.
     #[arg(long, value_enum, default_value_t = ScrollStyle::Smooth)]
     pub scroll: ScrollStyle,
@@ -60,6 +64,13 @@ pub enum MdvCommand {
         about = "Replace the current mdv executable when GitHub main publishes a different CI-generated bin/mdv"
     )]
     Update,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ColorSource {
+    #[default]
+    Terminal,
+    Github,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]

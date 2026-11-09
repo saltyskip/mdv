@@ -7,7 +7,7 @@ use tracing::info_span;
 use crate::{
     core::{config::AppConfig, document::Document},
     io::snapshot::render_html_to_raster,
-    render::github_html::build_github_html,
+    render::github_html::build_github_html_with_palette,
     ui::{
         page_graphics::{GraphicPage, build_graphic_page},
         terminal::CellMetrics,
@@ -43,7 +43,13 @@ pub(super) fn render_graphic_page(
         .unwrap_or_else(|| Path::new("."));
     let html = {
         let _span = info_span!("startup.build_github_html").entered();
-        build_github_html(source_text, base_dir, config.theme, config.mermaid_mode)?
+        build_github_html_with_palette(
+            source_text,
+            base_dir,
+            config.theme,
+            config.mermaid_mode,
+            config.palette,
+        )?
     };
     let snapshot = {
         let _span = info_span!("startup.render_html_to_raster").entered();

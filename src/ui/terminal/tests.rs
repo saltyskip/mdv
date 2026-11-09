@@ -8,7 +8,7 @@ use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use tempfile::NamedTempFile;
 
 use crate::{
-    cli::{ScrollStyle, Theme},
+    cli::{ColorSource, ScrollStyle, Theme},
     core::config::{AppConfig, MermaidMode},
     io::fs::FileSystemDocumentSource,
     render::text::{
@@ -256,6 +256,8 @@ fn try_new_degrades_gracefully_when_graphic_mode_unavailable() {
             mermaid_mode: MermaidMode::Disabled,
             scroll: ScrollStyle::Smooth,
             zoom_percent: 100,
+            colors: ColorSource::Github,
+            palette: None,
         },
         FileSystemDocumentSource::new(path),
         document,
@@ -289,6 +291,8 @@ fn sample_viewer(source: &str) -> TerminalViewer {
             mermaid_mode: MermaidMode::Disabled,
             scroll: ScrollStyle::Smooth,
             zoom_percent: 100,
+            colors: ColorSource::Github,
+            palette: None,
         },
         FileSystemDocumentSource::new(path),
         document,

@@ -9,7 +9,7 @@ use tracing::info_span;
 use crate::{
     cli::{MdvArgs, MdvCommand},
     core::config::AppConfig,
-    io::{fs::FileSystemDocumentSource, self_update},
+    io::{fs::FileSystemDocumentSource, self_update, terminal_colors::query_terminal_palette},
     render::{markdown::parse_document, text::render_plain_text},
     support::tracing::init_tracing,
     ui::terminal::TerminalViewer,
@@ -45,6 +45,10 @@ pub fn run(args: MdvArgs) -> Result<()> {
         ) {
             bail!("interactive mode requires Ghostty, Kitty, or WezTerm (Windows: WezTerm)");
         }
+        let config = {
+            let _span = info_span!("startup.query_terminal_palette").entered();
+            config.with_terminal_palette(query_terminal_palette())
+        };
         let mut viewer = {
             let _span = info_span!("startup.create_viewer").entered();
             TerminalViewer::try_new(config, source, document, content)?

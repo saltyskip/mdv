@@ -8,14 +8,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use comrak::plugins::syntect::{SyntectAdapter, SyntectAdapterBuilder};
 use url::Url;
 
-use crate::cli::Theme;
+use crate::{cli::Theme, core::terminal_palette::TerminalPalette};
 
 static LIGHT_SYNTAX_ADAPTER: OnceLock<SyntectAdapter> = OnceLock::new();
 static DARK_SYNTAX_ADAPTER: OnceLock<SyntectAdapter> = OnceLock::new();
 
-pub(super) fn theme_styles(theme: Theme) -> String {
+pub(super) fn theme_styles(theme: Theme, palette: Option<TerminalPalette>) -> String {
     let font_faces = font_face_css();
-    match theme {
+    let styles = match theme {
         Theme::Light | Theme::System => [
             font_faces.as_str(),
             "\n",
@@ -36,8 +36,53 @@ pub(super) fn theme_styles(theme: Theme) -> String {
             DARK_THEME_OVERRIDES,
         ]
         .concat(),
+    };
+    let styles = [styles.as_str(), "\n", FRONT_MATTER_STYLES].concat();
+    match palette {
+        Some(palette) => recolor(&styles, theme, palette),
+        None => styles,
     }
 }
+
+fn recolor(styles: &str, theme: Theme, palette: TerminalPalette) -> String {
+    let roles: &[(&[&str], String)] = match theme {
+        Theme::Dark => &[
+            (&["#f0f6fc"], palette.foreground.hex()),
+            (&["#0d1117"], palette.background.hex()),
+            (&["#9198a1", "#8b949e"], palette.muted().hex()),
+            (&["#3d444d", "#30363d"], palette.border().hex()),
+            (&["#151b23", "#161b22"], palette.surface().hex()),
+            (&["#4493f8"], palette.link().hex()),
+            (&["#1f6feb", "#1158c7"], palette.accent().hex()),
+            (&["#656c76"], palette.inline_code().hex()),
+        ],
+        Theme::Light | Theme::System => &[
+            (&["#1f2328"], palette.foreground.hex()),
+            (&["#ffffff"], palette.background.hex()),
+            (&["#59636e", "#57606a"], palette.muted().hex()),
+            (&["#d1d9e0", "#d0d7de"], palette.border().hex()),
+            (&["#f6f8fa"], palette.surface().hex()),
+            (&["#0969da"], palette.link().hex()),
+        ],
+    };
+    roles.iter().fold(styles.to_owned(), |styles, (originals, replacement)| {
+        originals.iter().fold(styles, |styles, original| {
+            styles.replace(original, replacement).replace(&original.to_uppercase(), replacement)
+        })
+    })
+}
+
+const FRONT_MATTER_STYLES: &str = r#"
+.markdown-body table.mdv-front-matter {
+  width: auto;
+  margin-bottom: 24px;
+}
+.markdown-body table.mdv-front-matter th {
+  text-align: left;
+  font-weight: 600;
+  white-space: nowrap;
+}
+"#;
 
 pub(super) fn syntax_adapter(theme: Theme) -> &'static SyntectAdapter {
     match theme {

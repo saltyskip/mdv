@@ -5,7 +5,9 @@ use comrak::{Arena, format_html_with_plugins, options::Plugins, parse_document};
 use tracing::info_span;
 
 use crate::{
-    cli::Theme, core::config::MermaidMode, io::mermaid_cli::MermaidCliRenderer,
+    cli::Theme,
+    core::{config::MermaidMode, terminal_palette::TerminalPalette},
+    io::mermaid_cli::MermaidCliRenderer,
     render::markdown_pipeline::gfm_options,
 };
 
@@ -29,8 +31,19 @@ pub fn build_github_html(
     theme: Theme,
     mermaid_mode: MermaidMode,
 ) -> Result<String> {
+    build_github_html_with_palette(source, base_dir, theme, mermaid_mode, None)
+}
+
+pub fn build_github_html_with_palette(
+    source: &str,
+    base_dir: &Path,
+    theme: Theme,
+    mermaid_mode: MermaidMode,
+    palette: Option<TerminalPalette>,
+) -> Result<String> {
     let _span = info_span!("github_html.build").entered();
     let mut options = gfm_options();
+    options.extension.front_matter_delimiter = Some("---".to_owned());
     options.render.escape = true;
     options.render.r#unsafe = false;
     options.render.tasklist_classes = true;
@@ -51,7 +64,8 @@ pub fn build_github_html(
         &inject_alert_icons(&rendered),
         theme,
     )));
-    let styles = theme_styles(theme);
+    let body_html = format!("{}{body_html}", front_matter_table(root));
+    let styles = theme_styles(theme, palette);
     let base_href = escape_attribute(&directory_url(base_dir)?);
 
     Ok(format!(
@@ -75,6 +89,58 @@ pub fn build_github_html(
         base_href = base_href,
         styles = styles,
     ))
+}
+
+fn front_matter_table<'a>(root: &'a comrak::nodes::AstNode<'a>) -> String {
+    let Some(front_matter) = root.children().find_map(|node| match &node.data.borrow().value {
+        comrak::nodes::NodeValue::FrontMatter(text) => Some(text.clone()),
+        _ => None,
+    }) else {
+        return String::new();
+    };
+    let rows: String = front_matter_fields(&front_matter)
+        .into_iter()
+        .map(|(key, value)| {
+            format!(
+                "<tr><th>{}</th><td>{}</td></tr>",
+                escape_attribute(&key),
+                escape_attribute(&value)
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!("<table class=\"mdv-front-matter\"><tbody>{rows}</tbody></table>\n")
+}
+
+fn front_matter_fields(front_matter: &str) -> Vec<(String, String)> {
+    front_matter.lines().filter(|line| line.trim() != "---" && !line.trim().is_empty()).fold(
+        Vec::<(String, String)>::new(),
+        |mut fields, line| {
+            let top_level = !line.starts_with([' ', '\t']);
+            match (top_level, line.split_once(':'), fields.last_mut()) {
+                (true, Some((key, value)), _) => {
+                    fields.push((key.trim().to_owned(), unquote(value.trim()).to_owned()));
+                }
+                (_, _, Some((_, value))) => {
+                    if !value.is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(line.trim());
+                }
+                _ => {}
+            }
+            fields
+        },
+    )
+}
+
+fn unquote(value: &str) -> &str {
+    ['"', '\'']
+        .iter()
+        .find_map(|quote| value.strip_prefix(*quote).and_then(|inner| inner.strip_suffix(*quote)))
+        .unwrap_or(value)
 }
 
 fn escape_attribute(value: &str) -> String {
