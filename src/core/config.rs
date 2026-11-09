@@ -23,7 +23,8 @@ impl TryFrom<MdvArgs> for AppConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: MdvArgs) -> Result<Self> {
-        let MdvArgs { command, path, watch, theme, no_mermaid, scroll, zoom, colors, .. } = value;
+        let watch = value.watches();
+        let MdvArgs { command, path, theme, no_mermaid, scroll, zoom, colors, .. } = value;
 
         if command.is_some() {
             bail!("view configuration cannot be built from a subcommand")

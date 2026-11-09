@@ -27,7 +27,7 @@ The [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/
 | **Mermaid diagrams**         | Flowcharts, sequence diagrams, and more — rendered inline                                      |
 | **Syntax highlighting**      | 100+ languages via [syntect](https://github.com/trishume/syntect)                              |
 | **System/light/dark themes** | `system` by default, with explicit `light` / `dark` overrides                                  |
-| **Watch mode**               | `--watch` auto-reloads on file change                                                          |
+| **Watch mode**               | Reloads on file change; `--no-watch` turns it off                                              |
 | **Quick update**             | `mdv update` selects the CI-generated macOS `bin/mdv` or Windows `bin/mdv.exe` from `main`      |
 | **Pipe-friendly**            | Plain-text fallback when stdout is not a TTY — works in CI and scripts                         |
 | **Vim navigation**           | `j`/`k`/`g`/`G`/PageUp/PageDown                                                                |
@@ -71,7 +71,7 @@ mdv README.md
 ```bash
 mdv README.md                           # system theme (default)
 mdv --theme dark notes.md               # dark theme
-mdv --watch docs/guide.md               # auto-reload on save
+mdv --no-watch docs/guide.md            # don't reload on save
 mdv --no-mermaid spec.md                # skip Mermaid rendering
 mdv --zoom 120 notes.md                 # 20% larger text than one line per terminal row
 mdv update                              # replace this mdv if main/bin/mdv changed

@@ -16,9 +16,13 @@ pub struct MdvArgs {
     /// Markdown file to open.
     pub path: Option<PathBuf>,
 
-    /// Reload the document when the file changes.
-    #[arg(long)]
+    /// Reload the document when the file changes (the default).
+    #[arg(long, overrides_with = "no_watch")]
     pub watch: bool,
+
+    /// Keep showing the document as it was when opened.
+    #[arg(long = "no-watch", overrides_with = "watch")]
+    pub no_watch: bool,
 
     /// Color theme used by the viewer.
     #[arg(long, value_enum, default_value_t = Theme::System)]
@@ -46,6 +50,11 @@ pub struct MdvArgs {
 }
 
 impl MdvArgs {
+    #[must_use]
+    pub const fn watches(&self) -> bool {
+        !self.no_watch
+    }
+
     #[must_use]
     pub fn parse_from<I, T>(itr: I) -> Self
     where

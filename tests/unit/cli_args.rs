@@ -25,3 +25,10 @@ fn defaults_theme_to_system() {
 
     assert_eq!(args.theme, Theme::System);
 }
+
+#[test]
+fn watching_is_the_default_and_no_watch_turns_it_off() {
+    assert!(MdvArgs::parse_from(["mdv", "notes.md"]).watches());
+    assert!(!MdvArgs::parse_from(["mdv", "notes.md", "--no-watch"]).watches());
+    assert!(MdvArgs::parse_from(["mdv", "notes.md", "--no-watch", "--watch"]).watches());
+}

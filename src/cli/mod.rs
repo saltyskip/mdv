@@ -23,7 +23,7 @@ pub fn startup_message(args: &MdvArgs) -> String {
     let path = args.path.as_deref().unwrap_or_else(|| std::path::Path::new("<missing>"));
     let mut message = format!("mdv: path={}", path.display());
 
-    if args.watch {
+    if args.watches() {
         message.push_str(" watch=on");
     }
 
