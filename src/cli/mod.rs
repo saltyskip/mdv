@@ -1,6 +1,6 @@
 mod args;
 
-pub use args::{MdvArgs, MdvCommand, Theme};
+pub use args::{MdvArgs, MdvCommand, ScrollStyle, Theme};
 
 #[must_use]
 pub fn parse() -> MdvArgs {

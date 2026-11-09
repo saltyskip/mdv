@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use crate::cli::{MdvArgs, Theme};
+use crate::cli::{MdvArgs, ScrollStyle, Theme};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppConfig {
@@ -10,13 +10,14 @@ pub struct AppConfig {
     pub watch: bool,
     pub theme: Theme,
     pub mermaid_mode: MermaidMode,
+    pub scroll: ScrollStyle,
 }
 
 impl TryFrom<MdvArgs> for AppConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: MdvArgs) -> Result<Self> {
-        let MdvArgs { command, path, watch, theme, no_mermaid, .. } = value;
+        let MdvArgs { command, path, watch, theme, no_mermaid, scroll, .. } = value;
 
         if command.is_some() {
             bail!("view configuration cannot be built from a subcommand")
@@ -26,7 +27,7 @@ impl TryFrom<MdvArgs> for AppConfig {
 
         let mermaid_mode = if no_mermaid { MermaidMode::Disabled } else { MermaidMode::Enabled };
 
-        Ok(Self { path, watch, theme: theme.resolve(), mermaid_mode })
+        Ok(Self { path, watch, theme: theme.resolve(), mermaid_mode, scroll })
     }
 }
 

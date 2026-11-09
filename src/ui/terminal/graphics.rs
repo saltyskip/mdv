@@ -12,7 +12,7 @@ use crate::{
 };
 
 mod resident;
-use resident::PageGraphics as ResidentGraphics;
+use resident::{PageGraphics as ResidentGraphics, Transfer, budget_from_env};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum GraphicsProtocol {
@@ -29,7 +29,7 @@ pub(super) struct PageGraphics {
 
 impl PageGraphics {
     pub(super) fn new(protocol: GraphicsProtocol) -> Self {
-        Self { protocol, resident: ResidentGraphics::default() }
+        Self { protocol, resident: ResidentGraphics::new(Transfer::from_env(), budget_from_env()) }
     }
 
     pub(super) fn is_inline(&self) -> bool {
@@ -56,7 +56,7 @@ impl PageGraphics {
                 let payload = STANDARD.encode(&raster.png_bytes);
                 commands.push(format!(
                     "{}\u{1b}]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=0;doNotMoveCursor=1:{payload}\u{7}",
-                    ansi_cursor_move(0, 0), raster.png_bytes.len(), page.width_cells, raster.rows,
+                    ansi_cursor_move(page.left_cells, 0), raster.png_bytes.len(), page.width_cells, raster.rows,
                 ));
             }
             return Ok((commands, Vec::new()));
@@ -287,182 +287,5 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixture should encode: {error}"));
         build_graphic_page(&png, 16, 8)
             .unwrap_or_else(|error| panic!("fixture page should decode: {error}"))
-    }
-
-    fn wait_for_preparation(graphics: &mut PageGraphics) -> Vec<String> {
-        while graphics.has_pending_work() {
-            let commands = graphics
-                .maintenance()
-                .unwrap_or_else(|error| panic!("resident preparation should complete: {error}"));
-            if !commands.is_empty() || !graphics.has_pending_work() {
-                return commands;
-            }
-            std::thread::yield_now();
-        }
-        Vec::new()
-    }
-
-    #[test]
-    fn resident_window_reuses_an_exact_crop_during_fractional_scroll() {
-        let page = page();
-        let mut graphics = PageGraphics::default();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-
-        let (first, visible) = graphics
-            .commands(&page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first resident window should render: {error}"));
-        let initial_payload = first
-            .iter()
-            .find(|command| command.contains("a=t"))
-            .and_then(|command| command.split_once(';'))
-            .map_or("", |(_, payload)| payload.trim_end_matches("\u{1b}\\"));
-        let initial = image::load_from_memory(
-            &STANDARD
-                .decode(initial_payload)
-                .unwrap_or_else(|error| panic!("initial payload should decode: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("initial png should decode: {error}"))
-        .to_rgba8();
-        assert_eq!(initial.dimensions(), (8, 8));
-        assert_eq!(*initial.get_pixel(7, 7), Rgba([7, 7, 40, 255]));
-        let prepared = wait_for_preparation(&mut graphics);
-        assert_eq!(prepared.iter().filter(|command| command.contains("a=t")).count(), 1);
-        assert!(!prepared.iter().any(|command| command.contains("a=p")));
-        let (second, _) = graphics
-            .commands(&page, 1.25, 4, metrics, &visible)
-            .unwrap_or_else(|error| panic!("resident window should render: {error}"));
-
-        assert_eq!(first.iter().filter(|command| command.contains("a=t")).count(), 1);
-        assert_eq!(second.iter().filter(|command| command.contains("a=t")).count(), 0);
-        assert!(second.iter().any(|command| command.contains("y=3,w=8,h=8")));
-
-        let payload = prepared
-            .iter()
-            .find(|command| command.contains("a=t"))
-            .and_then(|command| command.split_once(';'))
-            .map_or("", |(_, payload)| payload.trim_end_matches("\u{1b}\\"));
-        let uploaded = image::load_from_memory(
-            &STANDARD
-                .decode(payload)
-                .unwrap_or_else(|error| panic!("resident payload should decode: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("resident png should decode: {error}"))
-        .to_rgba8();
-        assert_eq!(*uploaded.get_pixel(7, 23), Rgba([7, 23, 40, 255]));
-        let visible = image::imageops::crop_imm(&uploaded, 0, 3, 8, 8).to_image();
-        let expected = image::imageops::crop_imm(page.image.as_ref(), 0, 3, 8, 8).to_image();
-        assert_eq!(visible, expected, "fractional placement must retain source pixels");
-    }
-
-    #[test]
-    fn resident_windows_evict_old_image_data_after_the_cache_is_full() {
-        let page = page();
-        let mut graphics = PageGraphics::default();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-
-        let (_, first_visible) = graphics
-            .commands(&page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first resident window should render: {error}"));
-        let (_, second_visible) = graphics
-            .commands(&page, 24.0, 4, metrics, &first_visible)
-            .unwrap_or_else(|error| panic!("second resident window should render: {error}"));
-        let (third, _) = graphics
-            .commands(&page, 48.0, 4, metrics, &second_visible)
-            .unwrap_or_else(|error| panic!("third resident window should render: {error}"));
-
-        assert!(third.iter().any(|command| command.contains("a=t")));
-        assert!(third.iter().any(|command| command.contains("a=d,d=I")));
-        assert_eq!(graphics.reset().len(), 2, "the cache retains only two resident images");
-    }
-
-    #[test]
-    fn reset_deletes_each_owned_resident_image() {
-        let page = page();
-        let mut graphics = PageGraphics::default();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-        let (_, first_visible) = graphics
-            .commands(&page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first resident window should render: {error}"));
-        let _ = graphics
-            .commands(&page, 24.0, 4, metrics, &first_visible)
-            .unwrap_or_else(|error| panic!("second resident window should render: {error}"));
-
-        let deletes = graphics.reset();
-
-        assert_eq!(deletes.len(), 2);
-        assert!(deletes.iter().all(|command| command.contains("a=d,d=I")));
-    }
-
-    #[test]
-    fn a_replaced_page_invalidates_resident_image_data() {
-        let first_page = page();
-        let second_page = page();
-        let mut graphics = PageGraphics::default();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-        let (_, visible) = graphics
-            .commands(&first_page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first page should render: {error}"));
-
-        let (commands, _) = graphics
-            .commands(&second_page, 0.0, 4, metrics, &visible)
-            .unwrap_or_else(|error| panic!("replaced page should render: {error}"));
-
-        assert_eq!(commands.iter().filter(|command| command.contains("a=d,d=I")).count(), 1);
-        assert_eq!(commands.iter().filter(|command| command.contains("a=t")).count(), 1);
-    }
-
-    #[test]
-    fn maintenance_uploads_a_prepared_hidden_window_without_a_placement() {
-        let page = page();
-        let mut graphics = PageGraphics::default();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-        let _ = graphics
-            .commands(&page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first resident window should render: {error}"));
-
-        assert!(graphics.has_pending_work());
-        let prepared = wait_for_preparation(&mut graphics);
-
-        assert_eq!(prepared.iter().filter(|command| command.contains("a=t")).count(), 1);
-        assert!(!prepared.iter().any(|command| command.contains("a=p")));
-        let payload = prepared
-            .iter()
-            .find(|command| command.contains("a=t"))
-            .and_then(|command| command.split_once(';'))
-            .map_or("", |(_, payload)| payload.trim_end_matches("\u{1b}\\"));
-        let uploaded = image::load_from_memory(
-            &STANDARD
-                .decode(payload)
-                .unwrap_or_else(|error| panic!("prepared payload should decode: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("prepared png should decode: {error}"))
-        .to_rgba8();
-        assert_eq!(*uploaded.get_pixel(7, 23), Rgba([7, 23, 40, 255]));
-        assert_eq!(
-            graphics.reset().len(),
-            2,
-            "one active and one prepared resident remain bounded"
-        );
-    }
-
-    #[test]
-    fn reset_discards_an_inflight_preparation() {
-        let page = page();
-        let mut graphics = PageGraphics::default();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-        let _ = graphics
-            .commands(&page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first resident window should render: {error}"));
-
-        assert!(graphics.has_pending_work());
-        let _ = graphics.reset();
-
-        assert!(!graphics.has_pending_work());
-        assert!(
-            graphics
-                .maintenance()
-                .unwrap_or_else(|error| panic!("stale preparation should not fail: {error}"))
-                .is_empty()
-        );
     }
 }

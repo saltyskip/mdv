@@ -28,6 +28,10 @@ pub struct MdvArgs {
     #[arg(long = "no-mermaid")]
     pub no_mermaid: bool,
 
+    /// How the page moves between scroll positions.
+    #[arg(long, value_enum, default_value_t = ScrollStyle::Smooth)]
+    pub scroll: ScrollStyle,
+
     /// Print the current version.
     #[arg(short = 'V', long = "version", global = true)]
     pub version: bool,
@@ -52,6 +56,13 @@ pub enum MdvCommand {
         about = "Replace the current mdv executable when GitHub main publishes a different CI-generated bin/mdv"
     )]
     Update,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ScrollStyle {
+    #[default]
+    Smooth,
+    Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]

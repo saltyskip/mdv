@@ -36,6 +36,7 @@ use self::{
 };
 use crate::render::text::render_document;
 use crate::{
+    cli::ScrollStyle,
     core::{config::AppConfig, document::Document, theme::ThemeTokens},
     io::fs::FileSystemDocumentSource,
     io::kitty_graphics::{DeleteCommand, encode_delete},
@@ -98,8 +99,9 @@ pub fn is_supported_terminal(term_program: Option<&str>, term: Option<&str>) -> 
 fn graphics_protocol(term_program: Option<&str>, term: Option<&str>) -> Option<GraphicsProtocol> {
     if term_program.is_some_and(|value| value.eq_ignore_ascii_case("wezterm")) {
         Some(GraphicsProtocol::Inline)
-    } else if term_program.is_some_and(|value| value.eq_ignore_ascii_case("ghostty"))
-        || term.is_some_and(|value| value.contains("kitty"))
+    } else if term_program.is_some_and(|value| {
+        value.eq_ignore_ascii_case("ghostty") || value.eq_ignore_ascii_case("rex")
+    }) || term.is_some_and(|value| value.contains("kitty"))
     {
         Some(GraphicsProtocol::Kitty)
     } else {
@@ -611,7 +613,7 @@ impl TerminalViewer {
             return false;
         }
         self.scroll = next_scroll;
-        if self.graphic_page.is_some() {
+        if self.graphic_page.is_some() && self.config.scroll == ScrollStyle::Smooth {
             self.scroll_motion.retarget(next_scroll, self.page_height() / 2);
         } else {
             self.scroll_motion.jump(next_scroll);

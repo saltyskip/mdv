@@ -1,14 +1,20 @@
 use std::{
-    io::Cursor,
+    fs,
+    path::PathBuf,
     sync::{
         Arc,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
 };
 
-use anyhow::{Context, Result};
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::{
+    ExtendedColorType, ImageEncoder, RgbaImage,
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+};
 
 use crate::{
     io::kitty_graphics::{
@@ -22,104 +28,120 @@ use crate::{
 
 use super::ansi_cursor_move;
 
-const RESIDENT_IMAGE_IDS: [u32; 2] = [1, u32::MAX];
-const MAX_RESIDENT_WINDOWS: usize = RESIDENT_IMAGE_IDS.len();
-const WINDOW_VIEWPORT_MULTIPLIER: u32 = 3;
-const MAX_WINDOW_HEIGHT_PX: u32 = 4096;
+const TILE_STRIDE_PX: u32 = 4096;
+const TILE_IMAGE_ID_BASE: u32 = 0x4d44_0000;
+const DEFAULT_BUDGET_BYTES: u64 = 120 * 1024 * 1024;
 
 type GraphicCommands = (Vec<String>, Vec<(u32, u32)>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::ui::terminal) enum Transfer {
+    File(PathBuf),
+    Direct,
+}
+
+impl Transfer {
+    pub(in crate::ui::terminal) fn from_env() -> Self {
+        let remote =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        match std::env::var("MDV_GRAPHICS_TRANSFER").ok().as_deref() {
+            Some("direct") => Self::Direct,
+            Some("file") => Self::in_temp_dir(),
+            _ if remote => Self::Direct,
+            _ => Self::in_temp_dir(),
+        }
+    }
+
+    fn in_temp_dir() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let instance = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self::File(
+            std::env::temp_dir().join(format!("mdv-tiles-{}-{instance}", std::process::id())),
+        )
+    }
+}
+
+pub(in crate::ui::terminal) fn budget_from_env() -> u64 {
+    std::env::var("MDV_IMAGE_BUDGET_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|megabytes| *megabytes > 0)
+        .map_or(DEFAULT_BUDGET_BYTES, |megabytes| megabytes * 1024 * 1024)
+}
+
+#[derive(Clone, Debug)]
+enum Payload {
+    File(PathBuf),
+    Png(Vec<u8>),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PageKey {
     image_ptr: usize,
     image_width_px: u32,
     image_height_px: u32,
-    display_width_px: u32,
-    display_height_px: u32,
-}
-
-impl PageKey {
-    fn of(page: &GraphicPage) -> Self {
-        Self {
-            image_ptr: page.image.as_ref().as_raw().as_ptr() as usize,
-            image_width_px: page.image_width_px,
-            image_height_px: page.image_height_px,
-            display_width_px: page.display_width_px,
-            display_height_px: page.display_height_px,
-        }
-    }
+    overlap_px: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WindowSpec {
-    page: PageKey,
+struct TileSpan {
     source_y_px: u32,
     source_height_px: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ResidentWindow {
-    image_id: u32,
-    source_y_px: u32,
-    source_height_px: u32,
+struct Tile {
+    span: TileSpan,
+    payload: Option<Payload>,
+    resident: bool,
 }
 
-impl ResidentWindow {
-    fn contains(self, slice: ViewportSlice) -> bool {
-        let source_end = slice.source_y_px.saturating_add(slice.source_height_px);
-        let window_end = self.source_y_px.saturating_add(self.source_height_px);
-        slice.source_y_px >= self.source_y_px && source_end <= window_end
-    }
-
-    fn matches(self, spec: WindowSpec) -> bool {
-        self.source_y_px == spec.source_y_px && self.source_height_px == spec.source_height_px
-    }
-
-    fn distance_from(self, source_y_px: u32) -> u32 {
-        let window_end = self.source_y_px.saturating_add(self.source_height_px);
-        if source_y_px < self.source_y_px {
-            self.source_y_px.saturating_sub(source_y_px)
-        } else {
-            source_y_px.saturating_sub(window_end)
-        }
-    }
+struct TiledPage {
+    key: PageKey,
+    image: Arc<RgbaImage>,
+    tiles: Vec<Tile>,
+    current: usize,
+    direction: i8,
 }
 
-struct PreparedWindow {
-    spec: WindowSpec,
-    png_bytes: Vec<u8>,
-}
-
-struct PendingPreparation {
+struct Pending {
     generation: u64,
-    receiver: Receiver<Result<PreparedWindow>>,
+    index: usize,
+    receiver: Receiver<Result<Payload>>,
 }
 
 pub(in crate::ui::terminal) struct PageGraphics {
-    page: Option<PageKey>,
-    windows: Vec<ResidentWindow>,
-    active_image_id: Option<u32>,
-    last_source_y_px: Option<u32>,
-    motion_direction: i8,
+    transfer: Transfer,
+    budget_bytes: u64,
+    stride_px: u32,
     generation: u64,
-    pending: Option<PendingPreparation>,
+    page: Option<TiledPage>,
+    pending: Option<Pending>,
 }
 
 impl Default for PageGraphics {
     fn default() -> Self {
-        Self {
-            page: None,
-            windows: Vec::new(),
-            active_image_id: None,
-            last_source_y_px: None,
-            motion_direction: 1,
-            generation: 0,
-            pending: None,
-        }
+        Self::new(Transfer::Direct, DEFAULT_BUDGET_BYTES)
+    }
+}
+
+impl Drop for PageGraphics {
+    fn drop(&mut self) {
+        self.remove_tile_files();
     }
 }
 
 impl PageGraphics {
+    pub(in crate::ui::terminal) fn new(transfer: Transfer, budget_bytes: u64) -> Self {
+        Self {
+            transfer,
+            budget_bytes,
+            stride_px: TILE_STRIDE_PX,
+            generation: 0,
+            page: None,
+            pending: None,
+        }
+    }
+
     pub(in crate::ui::terminal) fn commands(
         &mut self,
         page: &GraphicPage,
@@ -128,33 +150,21 @@ impl PageGraphics {
         cell_metrics: CellMetrics,
         previous_visible_placements: &[(u32, u32)],
     ) -> Result<GraphicCommands> {
-        let mut commands = self.invalidate_for_page(page);
         let slice = viewport_slice_at(page, scroll_rows, content_height, cell_metrics.height_px);
         if slice.rows == 0 || slice.source_height_px == 0 {
-            self.active_image_id = None;
-            commands.extend(delete_hidden_placements(previous_visible_placements, &[]));
-            return Ok((commands, Vec::new()));
+            return Ok((delete_hidden_placements(previous_visible_placements, &[]), Vec::new()));
         }
 
-        let initial_upload = self.windows.is_empty();
-        if let Some(index) = self.containing_window_index(slice) {
-            self.active_image_id = Some(self.windows[index].image_id);
-        }
-        commands.extend(self.maintenance()?);
-        self.update_motion(slice.source_y_px);
-        let window_index = match self.containing_window_index(slice) {
-            Some(index) => index,
-            None => self.upload_window(page, slice, initial_upload, &mut commands)?,
-        };
-        let window = self.windows[window_index];
-        let image_id = window.image_id;
-        self.active_image_id = Some(image_id);
-        if initial_upload {
-            self.schedule_initial_preparation(page, slice)?;
-        } else {
-            self.schedule_lookahead(page, slice, window)?;
-        }
+        let overlap_px = viewport_slice_at(page, 0.0, content_height, cell_metrics.height_px)
+            .source_height_px
+            .max(slice.source_height_px);
+        let mut commands = self.invalidate_for_page(page, overlap_px);
+        let index = self.focus(slice)?;
+        commands.extend(self.make_resident_now(index)?);
+        commands.extend(self.prefetch()?);
 
+        let image_id = tile_image_id(index);
+        let span = self.tiled()?.tiles[index].span;
         let visible_placements = vec![(image_id, image_id)];
         commands.extend(delete_hidden_placements(previous_visible_placements, &visible_placements));
         let placement = KittyImagePlacement {
@@ -163,273 +173,325 @@ impl PageGraphics {
             columns: page.width_cells,
             rows: slice.rows,
             source_x_px: 0,
-            source_y_px: slice.source_y_px.saturating_sub(window.source_y_px),
+            source_y_px: slice.source_y_px - span.source_y_px,
             source_width_px: page.image_width_px,
             source_height_px: slice.source_height_px,
             cursor_x: 0,
             cursor_y: 0,
             z_index: -1,
         };
-        commands.push(format!("{}{}", ansi_cursor_move(0, 0), encode_place(&placement)));
+        commands.push(format!(
+            "{}{}",
+            ansi_cursor_move(page.left_cells, 0),
+            encode_place(&placement)
+        ));
 
         Ok((commands, visible_placements))
     }
 
     pub(in crate::ui::terminal) fn has_pending_work(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.next_candidate().is_some()
     }
 
     pub(in crate::ui::terminal) fn maintenance(&mut self) -> Result<Vec<String>> {
-        let Some(pending) = &self.pending else {
-            return Ok(Vec::new());
-        };
-        match pending.receiver.try_recv() {
-            Ok(result) => {
-                let generation = pending.generation;
-                self.pending = None;
-                self.apply_prepared(generation, result?)
-            }
-            Err(TryRecvError::Empty) => Ok(Vec::new()),
-            Err(TryRecvError::Disconnected) => {
-                self.pending = None;
-                Ok(Vec::new())
+        let mut commands = Vec::new();
+        if let Some(pending) = &self.pending {
+            match pending.receiver.try_recv() {
+                Ok(result) => {
+                    let (generation, index) = (pending.generation, pending.index);
+                    self.pending = None;
+                    let payload = result?;
+                    if generation == self.generation
+                        && let Some(page) = self.page.as_mut()
+                    {
+                        page.tiles[index].payload = Some(payload);
+                        commands.extend(self.admit(index).unwrap_or_default());
+                    }
+                }
+                Err(TryRecvError::Empty) => return Ok(commands),
+                Err(TryRecvError::Disconnected) => self.pending = None,
             }
         }
+        commands.extend(self.prefetch()?);
+        Ok(commands)
     }
 
     pub(in crate::ui::terminal) fn reset(&mut self) -> Vec<String> {
         self.generation = self.generation.wrapping_add(1);
-        self.page = None;
         self.pending = None;
-        self.active_image_id = None;
-        self.last_source_y_px = None;
-        self.motion_direction = 1;
-        self.windows
-            .drain(..)
-            .map(|window| encode_delete(DeleteCommand::Image { image_id: window.image_id }))
-            .collect()
+        self.remove_tile_files();
+        self.page
+            .take()
+            .map(|page| {
+                page.tiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tile)| tile.resident)
+                    .map(|(index, _)| {
+                        encode_delete(DeleteCommand::Image { image_id: tile_image_id(index) })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    fn invalidate_for_page(&mut self, page: &GraphicPage) -> Vec<String> {
-        let key = PageKey::of(page);
-        if self.page == Some(key) {
+    fn remove_tile_files(&self) {
+        if let Transfer::File(dir) = &self.transfer {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    fn tiled(&self) -> Result<&TiledPage> {
+        self.page.as_ref().ok_or_else(|| anyhow!("no page is tiled"))
+    }
+
+    fn invalidate_for_page(&mut self, page: &GraphicPage, overlap_px: u32) -> Vec<String> {
+        let key = PageKey {
+            image_ptr: page.image.as_ref().as_raw().as_ptr() as usize,
+            image_width_px: page.image_width_px,
+            image_height_px: page.image_height_px,
+            overlap_px,
+        };
+        if self.page.as_ref().is_some_and(|tiled| tiled.key == key) {
             return Vec::new();
         }
 
         let deletes = self.reset();
-        self.page = Some(key);
+        self.page = Some(TiledPage {
+            key,
+            image: Arc::clone(&page.image),
+            tiles: tile_spans(page.image_height_px, self.stride_px, overlap_px)
+                .into_iter()
+                .map(|span| Tile { span, payload: None, resident: false })
+                .collect(),
+            current: 0,
+            direction: 1,
+        });
         deletes
     }
 
-    fn update_motion(&mut self, source_y_px: u32) {
-        if let Some(previous) = self.last_source_y_px {
-            self.motion_direction = if source_y_px >= previous { 1 } else { -1 };
+    fn focus(&mut self, slice: ViewportSlice) -> Result<usize> {
+        let stride_px = self.stride_px;
+        let page = self.page.as_mut().ok_or_else(|| anyhow!("no page is tiled"))?;
+        let index = ((slice.source_y_px / stride_px) as usize).min(page.tiles.len() - 1);
+        if index != page.current {
+            page.direction = if index > page.current { 1 } else { -1 };
+            page.current = index;
         }
-        self.last_source_y_px = Some(source_y_px);
+        Ok(index)
     }
 
-    fn containing_window_index(&self, slice: ViewportSlice) -> Option<usize> {
-        self.active_image_id
-            .and_then(|image_id| {
-                self.windows
-                    .iter()
-                    .position(|window| window.image_id == image_id && window.contains(slice))
-            })
-            .or_else(|| self.windows.iter().position(|window| window.contains(slice)))
-    }
-
-    fn schedule_initial_preparation(
-        &mut self,
-        page: &GraphicPage,
-        slice: ViewportSlice,
-    ) -> Result<()> {
-        self.schedule_spec(page, resident_spec(page, slice))
-    }
-
-    fn schedule_lookahead(
-        &mut self,
-        page: &GraphicPage,
-        slice: ViewportSlice,
-        active: ResidentWindow,
-    ) -> Result<()> {
-        if self.pending.is_some() {
-            return Ok(());
-        }
-        let Some(target_slice) = adjacent_slice(page, slice, active, self.motion_direction) else {
-            return Ok(());
-        };
-        self.schedule_spec(page, resident_spec(page, target_slice))
-    }
-
-    fn schedule_spec(&mut self, page: &GraphicPage, spec: WindowSpec) -> Result<()> {
-        if self.pending.is_some() {
-            return Ok(());
-        }
-        if self.windows.iter().any(|window| window.matches(spec)) {
-            return Ok(());
-        }
-
-        let image = Arc::clone(&page.image);
-        let width_px = page.image_width_px;
-        let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("mdv-page-graphics".to_string())
-            .spawn(move || {
-                let result = encode_window(image, width_px, spec);
-                let _ = sender.send(result);
-            })
-            .context("failed to start resident graphics preparation")?;
-        self.pending = Some(PendingPreparation { generation: self.generation, receiver });
-        Ok(())
-    }
-
-    fn apply_prepared(&mut self, generation: u64, prepared: PreparedWindow) -> Result<Vec<String>> {
-        if generation != self.generation
-            || self.page != Some(prepared.spec.page)
-            || self.windows.iter().any(|window| window.matches(prepared.spec))
-        {
+    fn make_resident_now(&mut self, index: usize) -> Result<Vec<String>> {
+        let page = self.page.as_ref().ok_or_else(|| anyhow!("no page is tiled"))?;
+        if page.tiles[index].resident {
             return Ok(Vec::new());
         }
-
-        let (slot, image_id) = self.slot_for_window(prepared.spec.source_y_px);
-        let mut commands = Vec::new();
-        if slot < self.windows.len() {
-            commands.push(encode_delete(DeleteCommand::Image { image_id }));
-            self.windows[slot] = ResidentWindow {
-                image_id,
-                source_y_px: prepared.spec.source_y_px,
-                source_height_px: prepared.spec.source_height_px,
+        if page.tiles[index].payload.is_none() {
+            let payload = match self.pending.take_if(|pending| pending.index == index) {
+                Some(pending) => pending
+                    .receiver
+                    .recv()
+                    .context("tile preparation stopped before it finished")??,
+                None => prepare_tile(
+                    &page.image,
+                    page.tiles[index].span,
+                    &self.transfer,
+                    self.generation,
+                    index,
+                )?,
             };
-        } else {
-            self.windows.push(ResidentWindow {
-                image_id,
-                source_y_px: prepared.spec.source_y_px,
-                source_height_px: prepared.spec.source_height_px,
-            });
+            if let Some(page) = self.page.as_mut() {
+                page.tiles[index].payload = Some(payload);
+            }
         }
-        commands.push(encode_transmit_png(image_id, &prepared.png_bytes));
+        self.admit_evicting_anything(index)
+    }
+
+    fn admit_evicting_anything(&mut self, index: usize) -> Result<Vec<String>> {
+        let evictions =
+            self.evictions_for(index).unwrap_or_else(|| self.all_other_residents(index));
+        self.apply_admission(index, evictions)
+    }
+
+    fn admit(&mut self, index: usize) -> Option<Vec<String>> {
+        let evictions = self.evictions_for(index)?;
+        self.apply_admission(index, evictions).ok()
+    }
+
+    fn apply_admission(&mut self, index: usize, evictions: Vec<usize>) -> Result<Vec<String>> {
+        let page = self.page.as_mut().ok_or_else(|| anyhow!("no page is tiled"))?;
+        let width_px = page.key.image_width_px;
+        let tile = &page.tiles[index];
+        let payload =
+            tile.payload.as_ref().ok_or_else(|| anyhow!("tile {index} has no payload"))?;
+        let transmit =
+            transmit(tile_image_id(index), payload, width_px, tile.span.source_height_px);
+
+        let mut commands: Vec<String> = evictions
+            .into_iter()
+            .map(|evicted| {
+                page.tiles[evicted].resident = false;
+                encode_delete(DeleteCommand::Image { image_id: tile_image_id(evicted) })
+            })
+            .collect();
+        page.tiles[index].resident = true;
+        commands.push(transmit);
         Ok(commands)
     }
 
-    fn upload_window(
-        &mut self,
-        page: &GraphicPage,
-        slice: ViewportSlice,
-        exact_viewport: bool,
-        commands: &mut Vec<String>,
-    ) -> Result<usize> {
-        let spec = if exact_viewport {
-            WindowSpec {
-                page: PageKey::of(page),
-                source_y_px: slice.source_y_px,
-                source_height_px: slice.source_height_px,
-            }
-        } else {
-            resident_spec(page, slice)
-        };
-        let prepared = encode_window(Arc::clone(&page.image), page.image_width_px, spec)?;
-        let (slot, image_id) = self.slot_for_window(slice.source_y_px);
-        if slot < self.windows.len() {
-            commands.push(encode_delete(DeleteCommand::Image { image_id }));
-            self.windows[slot] = ResidentWindow {
-                image_id,
-                source_y_px: spec.source_y_px,
-                source_height_px: spec.source_height_px,
-            };
-        } else {
-            self.windows.push(ResidentWindow {
-                image_id,
-                source_y_px: spec.source_y_px,
-                source_height_px: spec.source_height_px,
-            });
-        }
-        commands.push(encode_transmit_png(image_id, &prepared.png_bytes));
-        Ok(slot)
-    }
+    fn evictions_for(&self, index: usize) -> Option<Vec<usize>> {
+        let page = self.page.as_ref()?;
+        let width_px = page.key.image_width_px;
+        let incoming = tile_bytes(page.tiles[index].span, width_px);
+        let distance = page.current.abs_diff(index);
+        let mut resident_bytes: u64 = page
+            .tiles
+            .iter()
+            .filter(|tile| tile.resident)
+            .map(|tile| tile_bytes(tile.span, width_px))
+            .sum();
 
-    fn slot_for_window(&self, source_y_px: u32) -> (usize, u32) {
-        if self.windows.len() < MAX_RESIDENT_WINDOWS {
-            let slot = self.windows.len();
-            return (slot, RESIDENT_IMAGE_IDS[slot]);
-        }
-        let slot = self
-            .windows
+        let mut farther: Vec<usize> = page
+            .tiles
             .iter()
             .enumerate()
-            .filter(|(_, window)| Some(window.image_id) != self.active_image_id)
-            .max_by_key(|(_, window)| window.distance_from(source_y_px))
-            .map_or(0, |(index, _)| index);
-        (slot, self.windows[slot].image_id)
+            .filter(|(other, tile)| tile.resident && page.current.abs_diff(*other) > distance)
+            .map(|(other, _)| other)
+            .collect();
+        farther.sort_by_key(|other| std::cmp::Reverse(page.current.abs_diff(*other)));
+
+        let mut evictions = Vec::new();
+        let mut farther = farther.into_iter();
+        while resident_bytes + incoming > self.budget_bytes {
+            let evicted = farther.next()?;
+            resident_bytes -= tile_bytes(page.tiles[evicted].span, width_px);
+            evictions.push(evicted);
+        }
+        Some(evictions)
+    }
+
+    fn all_other_residents(&self, index: usize) -> Vec<usize> {
+        self.page
+            .as_ref()
+            .map(|page| {
+                page.tiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, tile)| tile.resident && *other != index)
+                    .map(|(other, _)| other)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn next_candidate(&self) -> Option<usize> {
+        let page = self.page.as_ref()?;
+        let pending_index = self.pending.as_ref().map(|pending| pending.index);
+        let mut candidates: Vec<usize> = (0..page.tiles.len())
+            .filter(|index| !page.tiles[*index].resident && Some(*index) != pending_index)
+            .collect();
+        candidates.sort_by_key(|index| {
+            let ahead = (*index as i64 - page.current as i64).signum() == i64::from(page.direction);
+            (page.current.abs_diff(*index), !ahead)
+        });
+        candidates.into_iter().next().filter(|index| self.evictions_for(*index).is_some())
+    }
+
+    fn prefetch(&mut self) -> Result<Vec<String>> {
+        if self.pending.is_some() {
+            return Ok(Vec::new());
+        }
+        let Some(index) = self.next_candidate() else {
+            return Ok(Vec::new());
+        };
+        let page = self.tiled()?;
+        if page.tiles[index].payload.is_some() {
+            return Ok(self.admit(index).unwrap_or_default());
+        }
+
+        let image = Arc::clone(&page.image);
+        let span = page.tiles[index].span;
+        let transfer = self.transfer.clone();
+        let generation = self.generation;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("mdv-page-tiles".to_string())
+            .spawn(move || {
+                let _ = sender.send(prepare_tile(&image, span, &transfer, generation, index));
+            })
+            .context("failed to start page tile preparation")?;
+        self.pending = Some(Pending { generation, index, receiver });
+        Ok(Vec::new())
     }
 }
 
-fn encode_window(image: Arc<RgbaImage>, width_px: u32, spec: WindowSpec) -> Result<PreparedWindow> {
-    let cropped = image::imageops::crop_imm(
-        image.as_ref(),
-        0,
-        spec.source_y_px,
-        width_px,
-        spec.source_height_px,
-    )
-    .to_image();
-    let mut png = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(cropped)
-        .write_to(&mut png, ImageFormat::Png)
-        .context("failed to encode resident page window")?;
-    Ok(PreparedWindow { spec, png_bytes: png.into_inner() })
+fn tile_spans(image_height_px: u32, stride_px: u32, overlap_px: u32) -> Vec<TileSpan> {
+    let count = image_height_px.saturating_sub(1) / stride_px + 1;
+    (0..count)
+        .map(|index| {
+            let source_y_px = index * stride_px;
+            TileSpan {
+                source_y_px,
+                source_height_px: (stride_px + overlap_px)
+                    .min(image_height_px.saturating_sub(source_y_px))
+                    .max(1),
+            }
+        })
+        .collect()
 }
 
-fn resident_height(page: &GraphicPage, viewport_height_px: u32) -> u32 {
-    let desired = viewport_height_px
-        .saturating_mul(WINDOW_VIEWPORT_MULTIPLIER)
-        .min(MAX_WINDOW_HEIGHT_PX)
-        .max(viewport_height_px);
-    desired.min(page.image_height_px)
+fn tile_image_id(index: usize) -> u32 {
+    TILE_IMAGE_ID_BASE + index as u32
 }
 
-fn resident_spec(page: &GraphicPage, slice: ViewportSlice) -> WindowSpec {
-    let source_height_px = resident_height(page, slice.source_height_px);
-    WindowSpec {
-        page: PageKey::of(page),
-        source_y_px: resident_start(page, slice, source_height_px),
-        source_height_px,
+fn tile_bytes(span: TileSpan, width_px: u32) -> u64 {
+    u64::from(span.source_height_px) * u64::from(width_px) * 3
+}
+
+fn tile_pixels(image: &RgbaImage, span: TileSpan) -> Vec<u8> {
+    let row_bytes = image.width() as usize * 4;
+    let start = span.source_y_px as usize * row_bytes;
+    image.as_raw()[start..start + span.source_height_px as usize * row_bytes]
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect()
+}
+
+fn prepare_tile(
+    image: &RgbaImage,
+    span: TileSpan,
+    transfer: &Transfer,
+    generation: u64,
+    index: usize,
+) -> Result<Payload> {
+    let pixels = tile_pixels(image, span);
+    match transfer {
+        Transfer::File(dir) => {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            let path = dir.join(format!("{generation}-{index}.rgba"));
+            fs::write(&path, &pixels)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(Payload::File(path))
+        }
+        Transfer::Direct => {
+            let mut png = Vec::new();
+            PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
+                .write_image(&pixels, image.width(), span.source_height_px, ExtendedColorType::Rgb8)
+                .context("failed to encode page tile")?;
+            Ok(Payload::Png(png))
+        }
     }
 }
 
-fn resident_start(page: &GraphicPage, slice: ViewportSlice, resident_height_px: u32) -> u32 {
-    let margin = resident_height_px.saturating_sub(slice.source_height_px) / 2;
-    slice
-        .source_y_px
-        .saturating_sub(margin)
-        .min(page.image_height_px.saturating_sub(resident_height_px))
-}
-
-fn adjacent_slice(
-    page: &GraphicPage,
-    slice: ViewportSlice,
-    active: ResidentWindow,
-    direction: i8,
-) -> Option<ViewportSlice> {
-    let maximum_start = page.image_height_px.saturating_sub(slice.source_height_px);
-    let source_y_px = if direction < 0 {
-        active.source_y_px.saturating_sub(slice.source_height_px)
-    } else {
-        active
-            .source_y_px
-            .saturating_add(active.source_height_px)
-            .saturating_sub(slice.source_height_px)
-            .min(maximum_start)
-    };
-    if source_y_px == slice.source_y_px && active.contains(slice) {
-        return None;
+fn transmit(image_id: u32, payload: &Payload, width_px: u32, height_px: u32) -> String {
+    match payload {
+        Payload::File(path) => format!(
+            "\u{1b}_Ga=t,t=f,f=24,s={width_px},v={height_px},i={image_id},q=2;{}\u{1b}\\",
+            STANDARD.encode(path.as_os_str().as_encoded_bytes())
+        ),
+        Payload::Png(bytes) => encode_transmit_png(image_id, bytes),
     }
-    let source_height_px =
-        slice.source_height_px.min(page.image_height_px.saturating_sub(source_y_px));
-    (source_height_px > 0).then_some(ViewportSlice {
-        source_y_px,
-        source_height_px,
-        rows: slice.rows,
-    })
 }
 
 fn delete_hidden_placements(
@@ -447,64 +509,5 @@ fn delete_hidden_placements(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{io::Cursor, sync::mpsc};
-
-    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
-
-    use crate::ui::page_graphics::build_graphic_page;
-
-    use super::*;
-
-    fn page() -> GraphicPage {
-        let image = ImageBuffer::from_fn(8, 160, |x, y| Rgba([x as u8, y as u8, 40, 255]));
-        let mut png = Vec::new();
-        DynamicImage::ImageRgba8(image)
-            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-            .unwrap_or_else(|error| panic!("fixture should encode: {error}"));
-        build_graphic_page(&png, 16, 8)
-            .unwrap_or_else(|error| panic!("fixture page should decode: {error}"))
-    }
-
-    fn wait_until_ready_without_applying(graphics: &mut PageGraphics) {
-        let pending = graphics
-            .pending
-            .take()
-            .unwrap_or_else(|| panic!("a resident preparation should be pending"));
-        let prepared = pending
-            .receiver
-            .recv()
-            .unwrap_or_else(|error| panic!("resident preparation should complete: {error}"));
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(prepared)
-            .unwrap_or_else(|error| panic!("prepared result should remain available: {error}"));
-        graphics.pending = Some(PendingPreparation { generation: pending.generation, receiver });
-    }
-
-    #[test]
-    fn ready_forward_preparation_keeps_the_reversed_resident_window() {
-        let page = page();
-        let metrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
-        let mut graphics = PageGraphics::default();
-
-        let (_, first_visible) = graphics
-            .commands(&page, 0.0, 4, metrics, &[])
-            .unwrap_or_else(|error| panic!("first window should render: {error}"));
-        wait_until_ready_without_applying(&mut graphics);
-        let _ = graphics
-            .maintenance()
-            .unwrap_or_else(|error| panic!("forward window should prepare: {error}"));
-        let (_, forward_visible) = graphics
-            .commands(&page, 13.0, 4, metrics, &first_visible)
-            .unwrap_or_else(|error| panic!("forward resident should render: {error}"));
-        wait_until_ready_without_applying(&mut graphics);
-
-        let (reversed, _) = graphics
-            .commands(&page, 0.0, 4, metrics, &forward_visible)
-            .unwrap_or_else(|error| panic!("reversed resident should render: {error}"));
-
-        assert_eq!(reversed.iter().filter(|command| command.contains("a=t")).count(), 1);
-        assert!(reversed.iter().any(|command| command.contains("a=p,i=1")));
-    }
-}
+#[path = "resident_tests.rs"]
+mod tests;

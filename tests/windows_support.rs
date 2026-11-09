@@ -10,3 +10,8 @@ fn wezterm_is_an_interactive_image_terminal() {
 fn windows_terminal_is_not_mistaken_for_a_lossless_image_terminal() {
     assert!(!is_supported_terminal(Some("Windows Terminal"), Some("xterm-256color")));
 }
+
+#[test]
+fn rex_is_an_interactive_image_terminal() {
+    assert!(is_supported_terminal(Some("rex"), Some("xterm-256color")));
+}

@@ -1,11 +1,12 @@
 use std::{io::Cursor, sync::Arc};
 
 use anyhow::{Context, Result};
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use image::{DynamicImage, ImageFormat, RgbaImage, imageops::FilterType};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphicPage {
     pub width_cells: u16,
+    pub left_cells: u16,
     pub display_width_px: u32,
     pub display_height_px: u32,
     pub image_width_px: u32,
@@ -64,12 +65,34 @@ pub fn build_graphic_page(
 
     Ok(GraphicPage {
         width_cells,
+        left_cells: 0,
         display_width_px,
         display_height_px,
         image_width_px,
         image_height_px,
         image: Arc::new(image),
     })
+}
+
+impl GraphicPage {
+    #[must_use]
+    pub fn at_display_resolution(self) -> Self {
+        if self.image_width_px <= self.display_width_px {
+            return self;
+        }
+        let image = image::imageops::resize(
+            self.image.as_ref(),
+            self.display_width_px,
+            self.display_height_px,
+            FilterType::CatmullRom,
+        );
+        Self {
+            image_width_px: self.display_width_px,
+            image_height_px: self.display_height_px,
+            image: Arc::new(image),
+            ..self
+        }
+    }
 }
 
 #[must_use]
