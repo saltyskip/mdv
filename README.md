@@ -92,6 +92,7 @@ mdv ./README.md | head -n 50            # plain-text output (pipe/CI)
 | `r`                   | Reload file          |
 | `o`                   | Open link in browser |
 | `+` / `-` / `0`       | Bigger / smaller / default text |
+| `s`                   | Show or hide the status line |
 | `q`                   | Quit                 |
 
 ## Requirements

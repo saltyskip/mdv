@@ -18,24 +18,49 @@ const CSS_LINE_HEIGHT_PX: f32 = 24.0;
 pub(super) const ZOOM_PERCENT_RANGE: std::ops::RangeInclusive<u16> = 50..=300;
 const MAX_ARTICLE_CSS_PX: f32 = 980.0;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PageGeometry {
+    pub width_cells: u16,
+    pub left_cells: u16,
+    pub display_width_px: u32,
+    pub zoom: f32,
+}
+
+impl PageGeometry {
+    pub(super) fn current(config: &AppConfig, cell_metrics: CellMetrics) -> Self {
+        let viewport_width = terminal::size().map_or(80, |(width, _)| width).max(1);
+        let zoom =
+            cell_metrics.height_px / CSS_LINE_HEIGHT_PX * f32::from(config.zoom_percent) / 100.0;
+        let max_width_cells =
+            (MAX_ARTICLE_CSS_PX * zoom / cell_metrics.width_px).floor().max(1.0) as u16;
+        let width_cells = viewport_width.min(max_width_cells);
+        Self {
+            width_cells,
+            left_cells: (viewport_width - width_cells) / 2,
+            display_width_px: (f32::from(width_cells) * cell_metrics.width_px).round().max(1.0)
+                as u32,
+            zoom,
+        }
+    }
+
+    pub(super) fn renders_like(self, other: Self) -> bool {
+        Self { left_cells: 0, ..self } == Self { left_cells: 0, ..other }
+    }
+}
+
 pub(super) fn render_graphic_page(
     config: &AppConfig,
     document: &Document,
     source_text: &str,
-    cell_metrics: CellMetrics,
+    geometry: PageGeometry,
 ) -> Result<GraphicPage> {
     let _span = info_span!("startup.render_graphic_page").entered();
     if cfg!(test) {
         anyhow::bail!("graphic mode disabled during tests");
     }
 
-    let zoom = cell_metrics.height_px / CSS_LINE_HEIGHT_PX * f32::from(config.zoom_percent) / 100.0;
-    let viewport_width = terminal::size().map_or(80, |(width, _)| width).max(1);
-    let max_width_cells =
-        (MAX_ARTICLE_CSS_PX * zoom / cell_metrics.width_px).floor().max(1.0) as u16;
-    let width_cells = viewport_width.min(max_width_cells);
-    let display_width_px = (f32::from(width_cells) * cell_metrics.width_px).round().max(1.0) as u32;
-    let snapshot_width_px = ((display_width_px as f32) / zoom).round().max(1.0) as u32;
+    let snapshot_width_px =
+        ((geometry.display_width_px as f32) / geometry.zoom).round().max(1.0) as u32;
     let base_dir = document
         .path
         .parent()
@@ -58,9 +83,8 @@ pub(super) fn render_graphic_page(
 
     {
         let _span = info_span!("startup.build_graphic_page").entered();
-        let page = build_graphic_page(&snapshot, width_cells, display_width_px)?;
-        Ok(GraphicPage { left_cells: (viewport_width - width_cells) / 2, ..page }
-            .at_display_resolution())
+        let page = build_graphic_page(&snapshot, geometry.width_cells, geometry.display_width_px)?;
+        Ok(GraphicPage { left_cells: geometry.left_cells, ..page }.at_display_resolution())
     }
 }
 

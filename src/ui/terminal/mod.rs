@@ -2,6 +2,8 @@ use std::{
     cmp,
     collections::BTreeSet,
     io::{self, Write},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -12,7 +14,9 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute, queue,
-    style::{Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{
         self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -29,8 +33,8 @@ use self::{
     graphics::{GraphicsProtocol, PageGraphics, collect_graphics_commands, resize_graphic_space},
     highlight::highlight_code_terminal,
     layout::{
-        ZOOM_PERCENT_RANGE, article_origin, article_wrap_width, current_cell_metrics, fit_to_width,
-        render_graphic_page, truncate_visible,
+        PageGeometry, ZOOM_PERCENT_RANGE, article_origin, article_wrap_width, current_cell_metrics,
+        fit_to_width, render_graphic_page, truncate_visible,
     },
     scroll::ScrollMotion,
 };
@@ -52,7 +56,15 @@ use crate::{
 };
 
 const ZOOM_STEP_PERCENT: u16 = 10;
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+const NOTICE_DURATION: Duration = Duration::from_millis(1500);
 const DEFAULT_ZOOM_PERCENT: u16 = 100;
+
+#[derive(Clone, Copy)]
+enum ScrollAnchor {
+    Proportional,
+    Row,
+}
 
 #[derive(Clone, Copy)]
 struct GraphicViewport {
@@ -92,6 +104,17 @@ pub struct TerminalViewer {
     transmitted_graphics: BTreeSet<u32>,
     mermaid_renderer: MermaidCliRenderer,
     cell_metrics: CellMetrics,
+    geometry: PageGeometry,
+    layout_requested_at: Instant,
+    pending_render: Option<PendingRender>,
+    show_status: bool,
+    notice: Option<(String, Instant)>,
+    status_rows_drawn: u16,
+}
+
+struct PendingRender {
+    geometry: PageGeometry,
+    receiver: Receiver<Result<GraphicPage>>,
 }
 
 #[must_use]
@@ -128,9 +151,10 @@ impl TerminalViewer {
         source_text: String,
     ) -> Result<Self> {
         let cell_metrics = current_cell_metrics();
+        let geometry = PageGeometry::current(&config, cell_metrics);
         let last_modified = source.modified_at().ok();
         let (graphic_page, rendered, warning) =
-            match render_graphic_page(&config, &document, &source_text, cell_metrics) {
+            match render_graphic_page(&config, &document, &source_text, geometry) {
                 Ok(page) => (Some(page), None, None),
                 Err(error) => (
                     None,
@@ -167,6 +191,12 @@ impl TerminalViewer {
             transmitted_graphics: BTreeSet::new(),
             mermaid_renderer: MermaidCliRenderer::from_env(),
             cell_metrics,
+            geometry,
+            layout_requested_at: Instant::now(),
+            pending_render: None,
+            show_status: false,
+            notice: None,
+            status_rows_drawn: 0,
         })
     }
 
@@ -179,9 +209,10 @@ impl TerminalViewer {
         source_text: String,
     ) -> Self {
         let cell_metrics = current_cell_metrics();
+        let geometry = PageGeometry::current(&config, cell_metrics);
         let last_modified = source.modified_at().ok();
         let (graphic_page, rendered, warning) =
-            match render_graphic_page(&config, &document, &source_text, cell_metrics) {
+            match render_graphic_page(&config, &document, &source_text, geometry) {
                 Ok(page) => (Some(page), None, None),
                 Err(error) => (
                     None,
@@ -218,6 +249,12 @@ impl TerminalViewer {
             transmitted_graphics: BTreeSet::new(),
             mermaid_renderer: MermaidCliRenderer::from_env(),
             cell_metrics,
+            geometry,
+            layout_requested_at: Instant::now(),
+            pending_render: None,
+            show_status: false,
+            notice: None,
+            status_rows_drawn: 0,
         }
     }
 
@@ -275,6 +312,7 @@ impl TerminalViewer {
                 }
             }
             let now = Instant::now();
+            self.needs_redraw |= self.poll_layout(now);
             self.needs_redraw |= self.scroll_motion.advance(now.duration_since(last_motion_tick));
             last_motion_tick = now;
             if self.needs_redraw && now >= next_frame {
@@ -347,6 +385,7 @@ impl TerminalViewer {
                     flush_scroll(self, &mut next_scroll, &mut scroll_dirty);
                     self.cell_metrics = current_cell_metrics();
                     self.pending_layout_refresh = true;
+                    self.layout_requested_at = Instant::now();
                     self.needs_redraw = true;
                 }
                 Event::Key(key) => {
@@ -405,6 +444,10 @@ impl TerminalViewer {
                             );
                         }
                         KeyCode::Char('0') => self.set_zoom(DEFAULT_ZOOM_PERCENT),
+                        KeyCode::Char('s') => {
+                            self.show_status = !self.show_status;
+                            self.needs_redraw = true;
+                        }
                         _ => {}
                     }
                 }
@@ -429,20 +472,20 @@ impl TerminalViewer {
 
     fn draw(&mut self) -> Result<()> {
         let _span = tracing::info_span!("terminal.draw").entered();
-        if self.pending_layout_refresh {
-            let position = self.scroll as f64 / self.max_scroll().max(1) as f64;
-            self.rerender();
-            let max_scroll = self.max_scroll();
-            let _ =
-                self.set_scroll(((position * max_scroll as f64).round() as usize).min(max_scroll));
-            self.pending_layout_refresh = false;
-        }
-
         let mut frame = Vec::new();
         queue!(frame, BeginSynchronizedUpdate)?;
         let (width, height) = terminal::size()?;
-        let content_height = usize::from(height.saturating_sub(1));
+        let status_rows = self.status_rows();
+        let content_height = usize::from(height.saturating_sub(status_rows));
         let tokens = ThemeTokens::for_theme(self.config.theme);
+        if status_rows < self.status_rows_drawn {
+            queue!(
+                frame,
+                cursor::MoveTo(0, height.saturating_sub(1)),
+                Clear(ClearType::CurrentLine)
+            )?;
+        }
+        self.status_rows_drawn = status_rows;
         let article_width = article_wrap_width(width);
         let article_x = article_origin(width);
 
@@ -508,17 +551,26 @@ impl TerminalViewer {
         if self.graphic_page.is_some() && self.page_graphics.is_inline() {
             self.last_status = None;
         }
-        let status = self.status_line(usize::from(width));
-        if self.last_status.as_ref() != Some(&status) {
-            queue!(
-                frame,
-                cursor::MoveTo(0, height.saturating_sub(1)),
-                SetForegroundColor(tokens.foreground),
-                SetBackgroundColor(tokens.status_background),
-                Print(&status),
-                ResetColor
-            )?;
-            self.last_status = Some(status);
+        if status_rows == 0 {
+            self.last_status = None;
+        } else {
+            let status = self.status_line(usize::from(width));
+            if self.last_status.as_ref() != Some(&status) {
+                let muted = self.config.palette.map_or(tokens.muted, |palette| {
+                    let muted = palette.muted();
+                    Color::Rgb { r: muted.red, g: muted.green, b: muted.blue }
+                });
+                queue!(
+                    frame,
+                    cursor::MoveTo(0, height.saturating_sub(1)),
+                    ResetColor,
+                    Clear(ClearType::CurrentLine),
+                    SetForegroundColor(muted),
+                    Print(&status),
+                    ResetColor
+                )?;
+                self.last_status = Some(status);
+            }
         }
         queue!(frame, EndSynchronizedUpdate)?;
         let mut stdout = io::stdout().lock();
@@ -528,7 +580,134 @@ impl TerminalViewer {
     }
 
     fn page_height(&self) -> usize {
-        terminal::size().map(|(_, height)| usize::from(height.saturating_sub(1))).unwrap_or(20)
+        terminal::size()
+            .map(|(_, height)| usize::from(height.saturating_sub(self.status_rows())))
+            .unwrap_or(20)
+    }
+
+    fn status_rows(&self) -> u16 {
+        u16::from(
+            self.show_status
+                || self.notice.is_some()
+                || self.warning.is_some()
+                || self.pending_render.is_some(),
+        )
+    }
+
+    fn show_notice(&mut self, message: String) {
+        self.notice = Some((message, Instant::now() + NOTICE_DURATION));
+        self.needs_redraw = true;
+    }
+
+    fn poll_layout(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some(pending) = &self.pending_render {
+            match pending.receiver.try_recv() {
+                Ok(result) => {
+                    let geometry = pending.geometry;
+                    self.pending_render = None;
+                    self.apply_render(geometry, result, ScrollAnchor::Proportional);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.pending_render = None;
+                    changed = true;
+                }
+            }
+        }
+        if self.pending_layout_refresh && now >= self.layout_requested_at + RESIZE_SETTLE {
+            self.pending_layout_refresh = false;
+            self.refresh_layout();
+            changed = true;
+        }
+        if self.notice.as_ref().is_some_and(|(_, until)| now >= *until) {
+            self.notice = None;
+            changed = true;
+        }
+        changed
+    }
+
+    fn refresh_layout(&mut self) {
+        let geometry = PageGeometry::current(&self.config, self.cell_metrics);
+        let target = self.pending_render.as_ref().map_or(self.geometry, |pending| pending.geometry);
+        if !geometry.renders_like(target) {
+            self.start_render(geometry);
+            return;
+        }
+        if self.pending_render.is_none()
+            && let Some(page) = &self.graphic_page
+        {
+            self.graphic_page =
+                Some(GraphicPage { left_cells: geometry.left_cells, ..page.clone() });
+            self.geometry = geometry;
+            self.clear_text = true;
+        }
+        let max_scroll = self.max_scroll();
+        let _ = self.set_scroll(self.scroll.min(max_scroll));
+    }
+
+    fn start_render(&mut self, geometry: PageGeometry) {
+        let (sender, receiver) = mpsc::channel();
+        let config = self.config.clone();
+        let document = self.document.clone();
+        let source_text = self.source_text.clone();
+        let spawned = thread::Builder::new().name("mdv-page-render".to_string()).spawn(move || {
+            let _ = sender.send(render_graphic_page(&config, &document, &source_text, geometry));
+        });
+        match spawned {
+            Ok(_) => self.pending_render = Some(PendingRender { geometry, receiver }),
+            Err(error) => self.apply_render(
+                geometry,
+                Err(anyhow::Error::from(error).context("failed to start page rendering")),
+                ScrollAnchor::Proportional,
+            ),
+        }
+    }
+
+    fn apply_render(
+        &mut self,
+        geometry: PageGeometry,
+        result: Result<GraphicPage>,
+        anchor: ScrollAnchor,
+    ) {
+        let position = self.scroll as f64 / self.max_scroll().max(1) as f64;
+        match result {
+            Ok(graphic_page) => {
+                if self.rendered.take().is_some() {
+                    self.transmitted_graphics.clear();
+                    self.clear_all_graphics = true;
+                }
+                self.graphic_page = Some(graphic_page);
+                self.warning = None;
+            }
+            Err(error) => {
+                self.pending_image_deletes.extend(self.page_graphics.reset());
+                self.graphic_page = None;
+                self.rendered = Some(render_document(
+                    &self.document,
+                    self.config.theme,
+                    self.config.mermaid_mode,
+                    article_wrap_width(terminal::size().map_or(80, |(cols, _)| cols)),
+                    self.cell_metrics.width_px / self.cell_metrics.height_px,
+                ));
+                self.warning = Some(format!("graphic render failed: {error}"));
+                self.transmitted_graphics.clear();
+                self.visible_placements.clear();
+                self.clear_all_graphics = true;
+            }
+        }
+        self.geometry = geometry;
+        self.clear_text = true;
+        self.last_status = None;
+        let max_scroll = self.max_scroll();
+        self.scroll = match anchor {
+            ScrollAnchor::Proportional => (position * max_scroll as f64).round() as usize,
+            ScrollAnchor::Row => self.scroll,
+        }
+        .min(max_scroll);
+        self.scroll_motion.jump(self.scroll);
+        self.needs_redraw = true;
     }
 
     fn max_scroll(&self) -> usize {
@@ -563,6 +742,7 @@ impl TerminalViewer {
                     self.document = document;
                     self.source_text = content;
                     self.rerender();
+                    self.show_notice("reloaded".to_string());
                     let _ = self.set_scroll(cmp::min(self.scroll, self.max_scroll()));
                 }
                 Err(error) => {
@@ -592,37 +772,9 @@ impl TerminalViewer {
     }
 
     fn rerender(&mut self) {
-        self.pending_image_deletes.extend(self.page_graphics.reset());
-        self.clear_text = true;
-        self.last_status = None;
-        match render_graphic_page(
-            &self.config,
-            &self.document,
-            &self.source_text,
-            self.cell_metrics,
-        ) {
-            Ok(graphic_page) => {
-                self.graphic_page = Some(graphic_page);
-                self.rendered = None;
-                self.warning = None;
-            }
-            Err(error) => {
-                self.graphic_page = None;
-                self.rendered = Some(render_document(
-                    &self.document,
-                    self.config.theme,
-                    self.config.mermaid_mode,
-                    article_wrap_width(terminal::size().map_or(80, |(cols, _)| cols)),
-                    self.cell_metrics.width_px / self.cell_metrics.height_px,
-                ));
-                self.warning = Some(format!("graphic render failed: {error}"));
-            }
-        }
-        self.transmitted_graphics.clear();
-        self.visible_placements.clear();
-        self.clear_all_graphics = true;
-        self.scroll = cmp::min(self.scroll, self.max_scroll());
-        self.scroll_motion.jump(self.scroll);
+        let geometry = PageGeometry::current(&self.config, self.cell_metrics);
+        let result = render_graphic_page(&self.config, &self.document, &self.source_text, geometry);
+        self.apply_render(geometry, result, ScrollAnchor::Row);
     }
 
     fn set_zoom(&mut self, percent: u16) {
@@ -632,7 +784,8 @@ impl TerminalViewer {
         }
         self.config.zoom_percent = percent;
         self.pending_layout_refresh = true;
-        self.needs_redraw = true;
+        self.layout_requested_at = Instant::now() - RESIZE_SETTLE;
+        self.show_notice(format!("zoom {percent}%"));
     }
 
     fn set_scroll(&mut self, next_scroll: usize) -> bool {
@@ -851,16 +1004,20 @@ impl TerminalViewer {
     }
 
     fn status_line(&self, width: usize) -> String {
-        let warning = self.warning.clone().unwrap_or_default();
-        let status = format!(
-            " {} | rev={} | theme={} | zoom={}% | watch={} {}",
-            self.source.path().display(),
-            self.document.revision,
-            self.config.theme.as_str(),
-            self.config.zoom_percent,
-            if self.config.watch { "on" } else { "off" },
-            warning
+        let name = self.source.path().file_name().map_or_else(
+            || self.source.path().display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
         );
-        fit_to_width(&status, width)
+        let message = self
+            .warning
+            .clone()
+            .or_else(|| self.notice.as_ref().map(|(message, _)| message.clone()))
+            .or_else(|| self.pending_render.as_ref().map(|_| "rendering…".to_string()));
+        let status = [Some(name), Some(format!("{}%", self.config.zoom_percent)), message]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        fit_to_width(&format!(" {status}"), width)
     }
 }

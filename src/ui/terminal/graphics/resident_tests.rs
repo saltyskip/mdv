@@ -12,7 +12,7 @@ use super::*;
 const METRICS: CellMetrics = CellMetrics { width_px: 8.0, height_px: 2.0 };
 const ROWS: usize = 4;
 const STRIDE_PX: u32 = 16;
-const TILE_BYTES: u64 = (STRIDE_PX as u64 + 8) * 8 * 3;
+const TILE_BYTES: u64 = (STRIDE_PX as u64 + 10) * 8 * 3;
 
 fn page(height_px: u32) -> GraphicPage {
     let image = ImageBuffer::from_fn(8, height_px, |x, y| {
@@ -162,6 +162,8 @@ fn a_far_jump_evicts_the_farthest_tiles_first() {
         .commands(&page, 0.0, ROWS, METRICS, &[])
         .unwrap_or_else(|error| panic!("first: {error}"));
     let _ = settle(&mut graphics);
+    let first_tile_id =
+        graphics.tiled().unwrap_or_else(|error| panic!("tiled: {error}")).image_id(0);
 
     let (jump, _) = graphics
         .commands(&page, 70.0, ROWS, METRICS, &visible)
@@ -169,7 +171,7 @@ fn a_far_jump_evicts_the_farthest_tiles_first() {
     let _ = settle(&mut graphics);
 
     assert_eq!(count(&jump, "a=d,d=I"), 1);
-    assert!(jump.iter().any(|command| command.contains(&format!("i={}", tile_image_id(0)))));
+    assert!(jump.iter().any(|command| command.contains(&format!("i={first_tile_id}"))));
     assert_eq!(resident(&graphics), vec![7, 8, 9]);
 }
 
@@ -201,7 +203,7 @@ fn file_transfer_sends_a_path_to_raw_pixels_and_cleans_up() {
         .iter()
         .find(|command| command.contains("a=t"))
         .unwrap_or_else(|| panic!("a transmit command"));
-    assert!(transmit.contains("t=f,f=24,s=8,v=24"));
+    assert!(transmit.contains("t=f,f=24,s=8,v=26"));
     let (_, encoded) = transmit.split_once(';').unwrap_or_else(|| panic!("a path payload"));
     let path = String::from_utf8(
         STANDARD
@@ -213,7 +215,7 @@ fn file_transfer_sends_a_path_to_raw_pixels_and_cleans_up() {
     assert_eq!(
         pixels,
         DynamicImage::ImageRgba8(
-            image::imageops::crop_imm(page.image.as_ref(), 0, 0, 8, 24).to_image()
+            image::imageops::crop_imm(page.image.as_ref(), 0, 0, 8, 26).to_image()
         )
         .to_rgb8()
         .into_raw()
@@ -295,4 +297,48 @@ fn a_raster_wider_than_the_pane_is_stored_at_pane_resolution() {
     assert_eq!((page.image_width_px, page.image_height_px), (8, 160));
     assert_eq!((page.display_width_px, page.display_height_px), (8, 160));
     assert_eq!(*page.image.get_pixel(4, 80), Rgba([10, 20, 30, 255]));
+}
+
+#[test]
+fn a_shorter_viewport_keeps_every_resident_tile() {
+    let page = page(160);
+    let mut graphics = graphics(Transfer::Direct, u64::MAX);
+    let (_, visible) = graphics
+        .commands(&page, 0.0, ROWS, METRICS, &[])
+        .unwrap_or_else(|error| panic!("first: {error}"));
+    let _ = settle(&mut graphics);
+
+    let (shorter, _) = graphics
+        .commands(&page, 0.0, ROWS - 1, METRICS, &visible)
+        .unwrap_or_else(|error| panic!("shorter: {error}"));
+
+    assert_eq!(count(&shorter, "a=t"), 0);
+    assert_eq!(count(&shorter, "a=d"), 0);
+    assert_eq!(count(&shorter, "a=p"), 1);
+}
+
+#[test]
+fn a_replacement_page_is_placed_before_the_old_one_is_deleted() {
+    let first_page = page(160);
+    let second_page = page(160);
+    let mut graphics = graphics(Transfer::Direct, u64::MAX);
+    let (_, visible) = graphics
+        .commands(&first_page, 0.0, ROWS, METRICS, &[])
+        .unwrap_or_else(|error| panic!("first: {error}"));
+    let _ = settle(&mut graphics);
+
+    let (swap, placements) = graphics
+        .commands(&second_page, 0.0, ROWS, METRICS, &visible)
+        .unwrap_or_else(|error| panic!("swap: {error}"));
+
+    let place = swap
+        .iter()
+        .position(|command| command.contains("a=p"))
+        .unwrap_or_else(|| panic!("a placement"));
+    let first_delete = swap
+        .iter()
+        .position(|command| command.contains("a=d"))
+        .unwrap_or_else(|| panic!("old images are deleted"));
+    assert!(place < first_delete, "the new page must be on screen before the old one goes");
+    assert_ne!(visible, placements, "the new page uses fresh image ids");
 }

@@ -30,6 +30,7 @@ use super::ansi_cursor_move;
 
 const TILE_STRIDE_PX: u32 = 4096;
 const TILE_IMAGE_ID_BASE: u32 = 0x4d44_0000;
+const TILE_IMAGE_ID_BANK: u32 = 0x0001_0000;
 const DEFAULT_BUDGET_BYTES: u64 = 120 * 1024 * 1024;
 
 type GraphicCommands = (Vec<String>, Vec<(u32, u32)>);
@@ -80,7 +81,6 @@ struct PageKey {
     image_ptr: usize,
     image_width_px: u32,
     image_height_px: u32,
-    overlap_px: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,10 +97,18 @@ struct Tile {
 
 struct TiledPage {
     key: PageKey,
+    overlap_px: u32,
+    id_base: u32,
     image: Arc<RgbaImage>,
     tiles: Vec<Tile>,
     current: usize,
     direction: i8,
+}
+
+impl TiledPage {
+    fn image_id(&self, index: usize) -> u32 {
+        self.id_base + index as u32
+    }
 }
 
 struct Pending {
@@ -158,15 +166,15 @@ impl PageGraphics {
         let overlap_px = viewport_slice_at(page, 0.0, content_height, cell_metrics.height_px)
             .source_height_px
             .max(slice.source_height_px);
-        let mut commands = self.invalidate_for_page(page, overlap_px);
+        let stale_images = self.invalidate_for_page(page, overlap_px);
         let index = self.focus(slice)?;
-        commands.extend(self.make_resident_now(index)?);
+        let mut commands = self.make_resident_now(index)?;
         commands.extend(self.prefetch()?);
 
-        let image_id = tile_image_id(index);
-        let span = self.tiled()?.tiles[index].span;
+        let tiled = self.tiled()?;
+        let image_id = tiled.image_id(index);
+        let span = tiled.tiles[index].span;
         let visible_placements = vec![(image_id, image_id)];
-        commands.extend(delete_hidden_placements(previous_visible_placements, &visible_placements));
         let placement = KittyImagePlacement {
             image_id,
             placement_id: image_id,
@@ -185,6 +193,8 @@ impl PageGraphics {
             ansi_cursor_move(page.left_cells, 0),
             encode_place(&placement)
         ));
+        commands.extend(delete_hidden_placements(previous_visible_placements, &visible_placements));
+        commands.extend(stale_images);
 
         Ok((commands, visible_placements))
     }
@@ -228,7 +238,7 @@ impl PageGraphics {
                     .enumerate()
                     .filter(|(_, tile)| tile.resident)
                     .map(|(index, _)| {
-                        encode_delete(DeleteCommand::Image { image_id: tile_image_id(index) })
+                        encode_delete(DeleteCommand::Image { image_id: page.image_id(index) })
                     })
                     .collect()
             })
@@ -245,20 +255,26 @@ impl PageGraphics {
         self.page.as_ref().ok_or_else(|| anyhow!("no page is tiled"))
     }
 
-    fn invalidate_for_page(&mut self, page: &GraphicPage, overlap_px: u32) -> Vec<String> {
+    fn invalidate_for_page(&mut self, page: &GraphicPage, needed_overlap_px: u32) -> Vec<String> {
         let key = PageKey {
             image_ptr: page.image.as_ref().as_raw().as_ptr() as usize,
             image_width_px: page.image_width_px,
             image_height_px: page.image_height_px,
-            overlap_px,
         };
-        if self.page.as_ref().is_some_and(|tiled| tiled.key == key) {
+        if self
+            .page
+            .as_ref()
+            .is_some_and(|tiled| tiled.key == key && tiled.overlap_px >= needed_overlap_px)
+        {
             return Vec::new();
         }
+        let overlap_px = needed_overlap_px + needed_overlap_px / 4;
 
         let deletes = self.reset();
         self.page = Some(TiledPage {
             key,
+            overlap_px,
+            id_base: TILE_IMAGE_ID_BASE + (self.generation % 2) as u32 * TILE_IMAGE_ID_BANK,
             image: Arc::clone(&page.image),
             tiles: tile_spans(page.image_height_px, self.stride_px, overlap_px)
                 .into_iter()
@@ -325,13 +341,13 @@ impl PageGraphics {
         let payload =
             tile.payload.as_ref().ok_or_else(|| anyhow!("tile {index} has no payload"))?;
         let transmit =
-            transmit(tile_image_id(index), payload, width_px, tile.span.source_height_px);
+            transmit(page.image_id(index), payload, width_px, tile.span.source_height_px);
 
         let mut commands: Vec<String> = evictions
             .into_iter()
             .map(|evicted| {
                 page.tiles[evicted].resident = false;
-                encode_delete(DeleteCommand::Image { image_id: tile_image_id(evicted) })
+                encode_delete(DeleteCommand::Image { image_id: page.image_id(evicted) })
             })
             .collect();
         page.tiles[index].resident = true;
@@ -438,10 +454,6 @@ fn tile_spans(image_height_px: u32, stride_px: u32, overlap_px: u32) -> Vec<Tile
             }
         })
         .collect()
-}
-
-fn tile_image_id(index: usize) -> u32 {
-    TILE_IMAGE_ID_BASE + index as u32
 }
 
 fn tile_bytes(span: TileSpan, width_px: u32) -> u64 {
