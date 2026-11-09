@@ -114,6 +114,8 @@ pub struct TerminalViewer {
 
 struct PendingRender {
     geometry: PageGeometry,
+    anchor: ScrollAnchor,
+    announce: bool,
     receiver: Receiver<Result<GraphicPage>>,
 }
 
@@ -153,23 +155,32 @@ impl TerminalViewer {
         let cell_metrics = current_cell_metrics();
         let geometry = PageGeometry::current(&config, cell_metrics);
         let last_modified = source.modified_at().ok();
-        let (graphic_page, rendered, warning) =
-            match render_graphic_page(&config, &document, &source_text, geometry) {
-                Ok(page) => (Some(page), None, None),
-                Err(error) => (
-                    None,
-                    Some(render_document(
-                        &document,
-                        config.theme,
-                        config.mermaid_mode,
-                        article_wrap_width(terminal::size().map_or(80, |(cols, _)| cols)),
-                        cell_metrics.width_px / cell_metrics.height_px,
-                    )),
-                    Some(format!("graphic mode unavailable: {error}")),
-                ),
-            };
+        let first_screen_px = terminal::size()
+            .map_or(40, |(_, rows)| rows)
+            .saturating_mul(cell_metrics.height_px.ceil() as u16);
+        let first_screen_px = u32::from(first_screen_px);
+        let (graphic_page, rendered, warning) = match render_graphic_page(
+            &config,
+            &document,
+            &source_text,
+            geometry,
+            Some(first_screen_px),
+        ) {
+            Ok(page) => (Some(page), None, None),
+            Err(error) => (
+                None,
+                Some(render_document(
+                    &document,
+                    config.theme,
+                    config.mermaid_mode,
+                    article_wrap_width(terminal::size().map_or(80, |(cols, _)| cols)),
+                    cell_metrics.width_px / cell_metrics.height_px,
+                )),
+                Some(format!("graphic mode unavailable: {error}")),
+            ),
+        };
 
-        Ok(Self {
+        let mut viewer = Self {
             config,
             source,
             document,
@@ -197,7 +208,15 @@ impl TerminalViewer {
             show_status: false,
             notice: None,
             status_rows_drawn: 0,
-        })
+        };
+        if viewer
+            .graphic_page
+            .as_ref()
+            .is_some_and(|page| page.display_height_px >= first_screen_px)
+        {
+            viewer.start_render(geometry, ScrollAnchor::Row, false);
+        }
+        Ok(viewer)
     }
 
     #[cfg(test)]
@@ -212,7 +231,7 @@ impl TerminalViewer {
         let geometry = PageGeometry::current(&config, cell_metrics);
         let last_modified = source.modified_at().ok();
         let (graphic_page, rendered, warning) =
-            match render_graphic_page(&config, &document, &source_text, geometry) {
+            match render_graphic_page(&config, &document, &source_text, geometry, None) {
                 Ok(page) => (Some(page), None, None),
                 Err(error) => (
                     None,
@@ -590,7 +609,7 @@ impl TerminalViewer {
             self.show_status
                 || self.notice.is_some()
                 || self.warning.is_some()
-                || self.pending_render.is_some(),
+                || self.pending_render.as_ref().is_some_and(|pending| pending.announce),
         )
     }
 
@@ -604,9 +623,9 @@ impl TerminalViewer {
         if let Some(pending) = &self.pending_render {
             match pending.receiver.try_recv() {
                 Ok(result) => {
-                    let geometry = pending.geometry;
+                    let (geometry, anchor) = (pending.geometry, pending.anchor);
                     self.pending_render = None;
-                    self.apply_render(geometry, result, ScrollAnchor::Proportional);
+                    self.apply_render(geometry, result, anchor);
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -632,7 +651,7 @@ impl TerminalViewer {
         let geometry = PageGeometry::current(&self.config, self.cell_metrics);
         let target = self.pending_render.as_ref().map_or(self.geometry, |pending| pending.geometry);
         if !geometry.renders_like(target) {
-            self.start_render(geometry);
+            self.start_render(geometry, ScrollAnchor::Proportional, true);
             return;
         }
         if self.pending_render.is_none()
@@ -647,20 +666,23 @@ impl TerminalViewer {
         let _ = self.set_scroll(self.scroll.min(max_scroll));
     }
 
-    fn start_render(&mut self, geometry: PageGeometry) {
+    fn start_render(&mut self, geometry: PageGeometry, anchor: ScrollAnchor, announce: bool) {
         let (sender, receiver) = mpsc::channel();
         let config = self.config.clone();
         let document = self.document.clone();
         let source_text = self.source_text.clone();
         let spawned = thread::Builder::new().name("mdv-page-render".to_string()).spawn(move || {
-            let _ = sender.send(render_graphic_page(&config, &document, &source_text, geometry));
+            let _ =
+                sender.send(render_graphic_page(&config, &document, &source_text, geometry, None));
         });
         match spawned {
-            Ok(_) => self.pending_render = Some(PendingRender { geometry, receiver }),
+            Ok(_) => {
+                self.pending_render = Some(PendingRender { geometry, anchor, announce, receiver });
+            }
             Err(error) => self.apply_render(
                 geometry,
                 Err(anyhow::Error::from(error).context("failed to start page rendering")),
-                ScrollAnchor::Proportional,
+                anchor,
             ),
         }
     }
@@ -773,7 +795,8 @@ impl TerminalViewer {
 
     fn rerender(&mut self) {
         let geometry = PageGeometry::current(&self.config, self.cell_metrics);
-        let result = render_graphic_page(&self.config, &self.document, &self.source_text, geometry);
+        let result =
+            render_graphic_page(&self.config, &self.document, &self.source_text, geometry, None);
         self.apply_render(geometry, result, ScrollAnchor::Row);
     }
 
@@ -1012,7 +1035,12 @@ impl TerminalViewer {
             .warning
             .clone()
             .or_else(|| self.notice.as_ref().map(|(message, _)| message.clone()))
-            .or_else(|| self.pending_render.as_ref().map(|_| "rendering…".to_string()));
+            .or_else(|| {
+                self.pending_render
+                    .as_ref()
+                    .filter(|pending| pending.announce)
+                    .map(|_| "rendering…".to_string())
+            });
         let status = [Some(name), Some(format!("{}%", self.config.zoom_percent)), message]
             .into_iter()
             .flatten()

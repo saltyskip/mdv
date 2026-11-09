@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::io::snapshot::SnapshotSize;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
@@ -29,15 +30,15 @@ pub(super) fn render(
     read_access_root: &Path,
     output_path: &Path,
     report_path: &Path,
-    width: u32,
-    output_width_px: Option<u32>,
+    size: SnapshotSize,
     format: &str,
 ) -> Result<()> {
     let directory = worker_directory()?;
     let request = serde_json::json!({
         "html_path": html_path, "read_access_root": read_access_root,
-        "output_path": output_path, "report_path": report_path, "width": width,
-        "output_width_px": output_width_px, "output_format": format, "timeout_ms": 25_000,
+        "output_path": output_path, "report_path": report_path, "width": size.css_width,
+        "output_width_px": size.output_width_px, "max_height": size.max_css_height,
+        "output_format": format, "timeout_ms": 25_000,
     });
     // Idle shutdown can race a connection. A render is idempotent, so retry a closed connection once.
     let response = send(&directory, &request).or_else(|error| {

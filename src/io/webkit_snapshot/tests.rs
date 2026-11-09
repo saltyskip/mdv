@@ -12,8 +12,7 @@ fn platform_raster_facade_preserves_lossless_graphics_input() {
     let raster = crate::io::snapshot::render_html_to_raster(
         "<body style='margin:0;background:#243b53'><h1>Raster</h1></body>",
         workspace.path(),
-        320,
-        None,
+        crate::io::snapshot::SnapshotSize::css_width(320),
     )
     .unwrap_or_else(|error| panic!("platform raster facade should render: {error:#}"));
 
@@ -30,8 +29,11 @@ fn a_requested_output_width_comes_back_at_that_pixel_width() {
     let raster = crate::io::snapshot::render_html_to_raster(
         "<body style='margin:0;background:#243b53'><h1>Raster</h1></body>",
         workspace.path(),
-        320,
-        Some(400),
+        crate::io::snapshot::SnapshotSize {
+            css_width: 320,
+            output_width_px: Some(400),
+            max_css_height: None,
+        },
     )
     .unwrap_or_else(|error| panic!("platform raster facade should render: {error:#}"));
 

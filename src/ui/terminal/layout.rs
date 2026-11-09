@@ -6,7 +6,7 @@ use tracing::info_span;
 
 use crate::{
     core::{config::AppConfig, document::Document},
-    io::snapshot::render_html_to_raster,
+    io::snapshot::{SnapshotSize, render_html_to_raster},
     render::github_html::build_github_html_with_palette,
     ui::{
         page_graphics::{GraphicPage, build_graphic_page},
@@ -53,6 +53,7 @@ pub(super) fn render_graphic_page(
     document: &Document,
     source_text: &str,
     geometry: PageGeometry,
+    first_screen_px: Option<u32>,
 ) -> Result<GraphicPage> {
     let _span = info_span!("startup.render_graphic_page").entered();
     if cfg!(test) {
@@ -78,7 +79,16 @@ pub(super) fn render_graphic_page(
     };
     let snapshot = {
         let _span = info_span!("startup.render_html_to_raster").entered();
-        render_html_to_raster(&html, base_dir, snapshot_width_px, Some(geometry.display_width_px))?
+        render_html_to_raster(
+            &html,
+            base_dir,
+            SnapshotSize {
+                css_width: snapshot_width_px,
+                output_width_px: Some(geometry.display_width_px),
+                max_css_height: first_screen_px
+                    .map(|px| (px as f32 / geometry.zoom).ceil().max(1.0) as u32),
+            },
+        )?
     };
 
     {

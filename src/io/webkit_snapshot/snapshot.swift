@@ -42,6 +42,7 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
     private let reportURL: URL
     private let viewportWidth: CGFloat
     private let outputWidthPx: CGFloat?
+    private let maxHeight: CGFloat?
     private let outputFormat: String
     private(set) var done = false
     private(set) var failure: String?
@@ -60,6 +61,7 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
         reportURL: URL,
         viewportWidth: CGFloat,
         outputWidthPx: CGFloat? = nil,
+        maxHeight: CGFloat? = nil,
         outputFormat: String = "png",
         webView: WKWebView? = nil,
         completion: ((String?) -> Void)? = nil
@@ -70,6 +72,7 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
         self.reportURL = reportURL
         self.viewportWidth = viewportWidth
         self.outputWidthPx = outputWidthPx
+        self.maxHeight = maxHeight
         self.outputFormat = outputFormat
         self.completion = completion
         if let webView {
@@ -284,7 +287,7 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
         guard !done else { return }
         profile("visuals_ready")
         let configuration = WKSnapshotConfiguration()
-        configuration.rect = CGRect(x: 0, y: 0, width: viewportWidth, height: height)
+        configuration.rect = CGRect(x: 0, y: 0, width: viewportWidth, height: min(height, maxHeight ?? height))
         configuration.afterScreenUpdates = true
 
         webView.takeSnapshot(with: configuration) { image, error in
@@ -378,6 +381,7 @@ private struct SnapshotRequest: Decodable {
     let reportPath: String
     let width: UInt32
     let outputWidthPx: UInt32?
+    let maxHeight: UInt32?
     let outputFormat: String?
     let timeoutMs: UInt32?
 
@@ -388,6 +392,7 @@ private struct SnapshotRequest: Decodable {
         case reportPath = "report_path"
         case width
         case outputWidthPx = "output_width_px"
+        case maxHeight = "max_height"
         case outputFormat = "output_format"
         case timeoutMs = "timeout_ms"
     }
@@ -628,6 +633,7 @@ private final class SnapshotServer {
             reportURL: URL(fileURLWithPath: request.reportPath),
             viewportWidth: CGFloat(request.width),
             outputWidthPx: request.outputWidthPx.map { CGFloat($0) },
+            maxHeight: request.maxHeight.map { CGFloat($0) },
             outputFormat: request.outputFormat ?? "png",
             webView: webView
         ) { [weak self] failure in
