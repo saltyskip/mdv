@@ -255,6 +255,7 @@ fn try_new_degrades_gracefully_when_graphic_mode_unavailable() {
             theme: Theme::Light,
             mermaid_mode: MermaidMode::Disabled,
             scroll: ScrollStyle::Smooth,
+            zoom_percent: 100,
         },
         FileSystemDocumentSource::new(path),
         document,
@@ -287,6 +288,7 @@ fn sample_viewer(source: &str) -> TerminalViewer {
             theme: Theme::Light,
             mermaid_mode: MermaidMode::Disabled,
             scroll: ScrollStyle::Smooth,
+            zoom_percent: 100,
         },
         FileSystemDocumentSource::new(path),
         document,
@@ -305,4 +307,19 @@ fn key_event(ch: char) -> Event {
     let mut key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
     key.kind = KeyEventKind::Press;
     Event::Key(key)
+}
+
+#[test]
+fn zoom_keys_step_and_clamp_the_text_size() {
+    let mut viewer = sample_viewer(&long_document(64));
+
+    assert!(!viewer.apply_event_batch(vec![key_event('+'), key_event('+')]));
+    assert_eq!(viewer.config.zoom_percent, 120);
+    assert!(viewer.pending_layout_refresh);
+
+    assert!(!viewer.apply_event_batch(vec![key_event('-'); 40]));
+    assert_eq!(viewer.config.zoom_percent, 50);
+
+    assert!(!viewer.apply_event_batch(vec![key_event('0')]));
+    assert_eq!(viewer.config.zoom_percent, 100);
 }

@@ -73,6 +73,7 @@ mdv README.md                           # system theme (default)
 mdv --theme dark notes.md               # dark theme
 mdv --watch docs/guide.md               # auto-reload on save
 mdv --no-mermaid spec.md                # skip Mermaid rendering
+mdv --zoom 120 notes.md                 # 20% larger text than one line per terminal row
 mdv update                              # replace this mdv if main/bin/mdv changed
 mdv --version                           # print the current version
 mdv ./README.md | head -n 50            # plain-text output (pipe/CI)
@@ -90,6 +91,7 @@ mdv ./README.md | head -n 50            # plain-text output (pipe/CI)
 | Mouse wheel / trackpad | Smooth scroll      |
 | `r`                   | Reload file          |
 | `o`                   | Open link in browser |
+| `+` / `-` / `0`       | Bigger / smaller / default text |
 | `q`                   | Quit                 |
 
 ## Requirements

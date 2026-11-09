@@ -29,7 +29,7 @@ use self::{
     graphics::{GraphicsProtocol, PageGraphics, collect_graphics_commands, resize_graphic_space},
     highlight::highlight_code_terminal,
     layout::{
-        article_origin, article_wrap_width, current_cell_metrics, fit_to_width,
+        ZOOM_PERCENT_RANGE, article_origin, article_wrap_width, current_cell_metrics, fit_to_width,
         render_graphic_page, truncate_visible,
     },
     scroll::ScrollMotion,
@@ -50,6 +50,9 @@ use crate::{
     },
     ui::page_graphics::{GraphicPage, total_rows},
 };
+
+const ZOOM_STEP_PERCENT: u16 = 10;
+const DEFAULT_ZOOM_PERCENT: u16 = 100;
 
 #[derive(Clone, Copy)]
 struct GraphicViewport {
@@ -391,6 +394,17 @@ impl TerminalViewer {
                             next_scroll = self.scroll;
                             self.needs_redraw = true;
                         }
+                        KeyCode::Char('+' | '=') => {
+                            self.set_zoom(
+                                self.config.zoom_percent.saturating_add(ZOOM_STEP_PERCENT),
+                            );
+                        }
+                        KeyCode::Char('-') => {
+                            self.set_zoom(
+                                self.config.zoom_percent.saturating_sub(ZOOM_STEP_PERCENT),
+                            );
+                        }
+                        KeyCode::Char('0') => self.set_zoom(DEFAULT_ZOOM_PERCENT),
                         _ => {}
                     }
                 }
@@ -416,8 +430,11 @@ impl TerminalViewer {
     fn draw(&mut self) -> Result<()> {
         let _span = tracing::info_span!("terminal.draw").entered();
         if self.pending_layout_refresh {
+            let position = self.scroll as f64 / self.max_scroll().max(1) as f64;
             self.rerender();
-            let _ = self.set_scroll(cmp::min(self.scroll, self.max_scroll()));
+            let max_scroll = self.max_scroll();
+            let _ =
+                self.set_scroll(((position * max_scroll as f64).round() as usize).min(max_scroll));
             self.pending_layout_refresh = false;
         }
 
@@ -606,6 +623,16 @@ impl TerminalViewer {
         self.clear_all_graphics = true;
         self.scroll = cmp::min(self.scroll, self.max_scroll());
         self.scroll_motion.jump(self.scroll);
+    }
+
+    fn set_zoom(&mut self, percent: u16) {
+        let percent = percent.clamp(*ZOOM_PERCENT_RANGE.start(), *ZOOM_PERCENT_RANGE.end());
+        if percent == self.config.zoom_percent {
+            return;
+        }
+        self.config.zoom_percent = percent;
+        self.pending_layout_refresh = true;
+        self.needs_redraw = true;
     }
 
     fn set_scroll(&mut self, next_scroll: usize) -> bool {
@@ -826,10 +853,11 @@ impl TerminalViewer {
     fn status_line(&self, width: usize) -> String {
         let warning = self.warning.clone().unwrap_or_default();
         let status = format!(
-            " {} | rev={} | theme={} | watch={} {}",
+            " {} | rev={} | theme={} | zoom={}% | watch={} {}",
             self.source.path().display(),
             self.document.revision,
             self.config.theme.as_str(),
+            self.config.zoom_percent,
             if self.config.watch { "on" } else { "off" },
             warning
         );

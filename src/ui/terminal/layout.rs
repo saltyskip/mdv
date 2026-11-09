@@ -14,7 +14,8 @@ use crate::{
     },
 };
 
-const GRAPHIC_PAGE_ZOOM: f32 = 1.55;
+const CSS_LINE_HEIGHT_PX: f32 = 24.0;
+pub(super) const ZOOM_PERCENT_RANGE: std::ops::RangeInclusive<u16> = 50..=300;
 const MAX_ARTICLE_CSS_PX: f32 = 980.0;
 
 pub(super) fn render_graphic_page(
@@ -28,12 +29,13 @@ pub(super) fn render_graphic_page(
         anyhow::bail!("graphic mode disabled during tests");
     }
 
+    let zoom = cell_metrics.height_px / CSS_LINE_HEIGHT_PX * f32::from(config.zoom_percent) / 100.0;
     let viewport_width = terminal::size().map_or(80, |(width, _)| width).max(1);
     let max_width_cells =
-        (MAX_ARTICLE_CSS_PX * GRAPHIC_PAGE_ZOOM / cell_metrics.width_px).floor().max(1.0) as u16;
+        (MAX_ARTICLE_CSS_PX * zoom / cell_metrics.width_px).floor().max(1.0) as u16;
     let width_cells = viewport_width.min(max_width_cells);
     let display_width_px = (f32::from(width_cells) * cell_metrics.width_px).round().max(1.0) as u32;
-    let snapshot_width_px = ((display_width_px as f32) / GRAPHIC_PAGE_ZOOM).round().max(1.0) as u32;
+    let snapshot_width_px = ((display_width_px as f32) / zoom).round().max(1.0) as u32;
     let base_dir = document
         .path
         .parent()

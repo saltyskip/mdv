@@ -289,7 +289,7 @@ fn native_pty_preserves_rich_png_scrolling_resize_and_quit() {
         .master
         .as_ref()
         .unwrap_or_else(|| panic!("native PTY should remain open until after resize"))
-        .resize(size(100, 35))
+        .resize(size(60, 35))
         .unwrap_or_else(|error| panic!("native console resize should work: {error}"));
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {

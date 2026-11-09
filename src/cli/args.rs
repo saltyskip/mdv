@@ -28,6 +28,10 @@ pub struct MdvArgs {
     #[arg(long = "no-mermaid")]
     pub no_mermaid: bool,
 
+    /// Text size in percent; 100 sets one line of body text to one terminal row.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(50..=300))]
+    pub zoom: u16,
+
     /// How the page moves between scroll positions.
     #[arg(long, value_enum, default_value_t = ScrollStyle::Smooth)]
     pub scroll: ScrollStyle,

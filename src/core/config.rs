@@ -11,13 +11,14 @@ pub struct AppConfig {
     pub theme: Theme,
     pub mermaid_mode: MermaidMode,
     pub scroll: ScrollStyle,
+    pub zoom_percent: u16,
 }
 
 impl TryFrom<MdvArgs> for AppConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: MdvArgs) -> Result<Self> {
-        let MdvArgs { command, path, watch, theme, no_mermaid, scroll, .. } = value;
+        let MdvArgs { command, path, watch, theme, no_mermaid, scroll, zoom, .. } = value;
 
         if command.is_some() {
             bail!("view configuration cannot be built from a subcommand")
@@ -27,7 +28,7 @@ impl TryFrom<MdvArgs> for AppConfig {
 
         let mermaid_mode = if no_mermaid { MermaidMode::Disabled } else { MermaidMode::Enabled };
 
-        Ok(Self { path, watch, theme: theme.resolve(), mermaid_mode, scroll })
+        Ok(Self { path, watch, theme: theme.resolve(), mermaid_mode, scroll, zoom_percent: zoom })
     }
 }
 
