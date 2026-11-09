@@ -78,7 +78,7 @@ pub(super) fn render_graphic_page(
     };
     let snapshot = {
         let _span = info_span!("startup.render_html_to_raster").entered();
-        render_html_to_raster(&html, base_dir, snapshot_width_px)?
+        render_html_to_raster(&html, base_dir, snapshot_width_px, Some(geometry.display_width_px))?
     };
 
     {

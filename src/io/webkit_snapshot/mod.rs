@@ -36,13 +36,18 @@ pub fn render_html_to_png(
     base_dir: &Path,
     viewport_width_px: u32,
 ) -> Result<SnapshotResult> {
-    let (png_bytes, diagnostics) = render_image(html, base_dir, viewport_width_px, "png")?;
+    let (png_bytes, diagnostics) = render_image(html, base_dir, viewport_width_px, None, "png")?;
     Ok(SnapshotResult { png_bytes, diagnostics })
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn render_html_to_tiff(html: &str, base_dir: &Path, width: u32) -> Result<Vec<u8>> {
-    render_image(html, base_dir, width, "tiff").map(|(bytes, _)| bytes)
+pub(crate) fn render_html_to_tiff(
+    html: &str,
+    base_dir: &Path,
+    width: u32,
+    output_width_px: Option<u32>,
+) -> Result<Vec<u8>> {
+    render_image(html, base_dir, width, output_width_px, "tiff").map(|(bytes, _)| bytes)
 }
 
 #[cfg(target_os = "macos")]
@@ -50,6 +55,7 @@ fn render_image(
     html: &str,
     base_dir: &Path,
     viewport_width_px: u32,
+    output_width_px: Option<u32>,
     format: &str,
 ) -> Result<(Vec<u8>, SnapshotDiagnostics)> {
     let _span = info_span!("webkit_snapshot.render_image", viewport_width_px, format).entered();
@@ -58,8 +64,14 @@ fn render_image(
         .map_err(|_| anyhow::anyhow!("snapshot render lock poisoned"))?;
     let read_access_root = common_read_access_root(html, base_dir);
     let workspace = create_workspace(base_dir, &read_access_root)?;
-    let result =
-        render_in_workspace(html, &read_access_root, &workspace, viewport_width_px, format);
+    let result = render_in_workspace(
+        html,
+        &read_access_root,
+        &workspace,
+        viewport_width_px,
+        output_width_px,
+        format,
+    );
     let _ = cleanup_workspace(&workspace);
     result
 }
@@ -70,6 +82,7 @@ fn render_in_workspace(
     read_access_root: &Path,
     workspace: &Path,
     viewport_width_px: u32,
+    output_width_px: Option<u32>,
     format: &str,
 ) -> Result<(Vec<u8>, SnapshotDiagnostics)> {
     let html_path = workspace.join("document.html");
@@ -83,6 +96,7 @@ fn render_in_workspace(
         &output_path,
         &report_path,
         viewport_width_px,
+        output_width_px,
         format,
     )?;
 
@@ -101,6 +115,7 @@ fn render_image(
     _html: &str,
     _base_dir: &Path,
     _viewport_width_px: u32,
+    _output_width_px: Option<u32>,
     _format: &str,
 ) -> Result<(Vec<u8>, SnapshotDiagnostics)> {
     bail!("webkit snapshot rendering is only supported on macOS");

@@ -13,12 +13,34 @@ fn platform_raster_facade_preserves_lossless_graphics_input() {
         "<body style='margin:0;background:#243b53'><h1>Raster</h1></body>",
         workspace.path(),
         320,
+        None,
     )
     .unwrap_or_else(|error| panic!("platform raster facade should render: {error:#}"));
 
     assert!(
         image::load_from_memory(&raster).is_ok(),
         "the graphics pipeline must receive a decodable lossless raster"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_requested_output_width_comes_back_at_that_pixel_width() {
+    let workspace = tempfile::tempdir().unwrap_or_else(|error| panic!("workspace: {error}"));
+    let raster = crate::io::snapshot::render_html_to_raster(
+        "<body style='margin:0;background:#243b53'><h1>Raster</h1></body>",
+        workspace.path(),
+        320,
+        Some(400),
+    )
+    .unwrap_or_else(|error| panic!("platform raster facade should render: {error:#}"));
+
+    let image = image::load_from_memory(&raster)
+        .unwrap_or_else(|error| panic!("raster should decode: {error}"));
+    assert!(
+        image.width() <= 400 && image.width() >= 398,
+        "snapshot should come back at the requested width, got {}",
+        image.width()
     );
 }
 

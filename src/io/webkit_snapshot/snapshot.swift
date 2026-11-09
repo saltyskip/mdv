@@ -10,12 +10,38 @@ func profile(_ stage: String) {
     }
 }
 
+func eightBitRGBA(_ image: CGImage, maximumWidth: Int?) -> CGImage? {
+    let width = min(image.width, maximumWidth ?? image.width)
+    let height = max(1, Int((Double(image.height) * Double(width) / Double(image.width)).rounded()))
+    if width == image.width && image.bitsPerComponent == 8 && image.bitsPerPixel == 32 {
+        return image
+    }
+    guard
+        let space = CGColorSpace(name: CGColorSpace.sRGB),
+        let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+    else {
+        return nil
+    }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return context.makeImage()
+}
+
 final class SnapshotRunner: NSObject, WKNavigationDelegate {
     private let htmlURL: URL
     private let readAccessURL: URL
     private let outputURL: URL
     private let reportURL: URL
     private let viewportWidth: CGFloat
+    private let outputWidthPx: CGFloat?
     private let outputFormat: String
     private(set) var done = false
     private(set) var failure: String?
@@ -33,6 +59,7 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
         outputURL: URL,
         reportURL: URL,
         viewportWidth: CGFloat,
+        outputWidthPx: CGFloat? = nil,
         outputFormat: String = "png",
         webView: WKWebView? = nil,
         completion: ((String?) -> Void)? = nil
@@ -42,6 +69,7 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
         self.outputURL = outputURL
         self.reportURL = reportURL
         self.viewportWidth = viewportWidth
+        self.outputWidthPx = outputWidthPx
         self.outputFormat = outputFormat
         self.completion = completion
         if let webView {
@@ -268,7 +296,8 @@ final class SnapshotRunner: NSObject, WKNavigationDelegate {
             }
             guard
                 let image,
-                let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+                let snapshotImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                let cgImage = eightBitRGBA(snapshotImage, maximumWidth: self.outputWidthPx.map { Int($0) })
             else {
                 self.fail("failed to obtain snapshot pixels")
                 return
@@ -348,6 +377,7 @@ private struct SnapshotRequest: Decodable {
     let outputPath: String
     let reportPath: String
     let width: UInt32
+    let outputWidthPx: UInt32?
     let outputFormat: String?
     let timeoutMs: UInt32?
 
@@ -357,6 +387,7 @@ private struct SnapshotRequest: Decodable {
         case outputPath = "output_path"
         case reportPath = "report_path"
         case width
+        case outputWidthPx = "output_width_px"
         case outputFormat = "output_format"
         case timeoutMs = "timeout_ms"
     }
@@ -596,6 +627,7 @@ private final class SnapshotServer {
             outputURL: URL(fileURLWithPath: request.outputPath),
             reportURL: URL(fileURLWithPath: request.reportPath),
             viewportWidth: CGFloat(request.width),
+            outputWidthPx: request.outputWidthPx.map { CGFloat($0) },
             outputFormat: request.outputFormat ?? "png",
             webView: webView
         ) { [weak self] failure in
